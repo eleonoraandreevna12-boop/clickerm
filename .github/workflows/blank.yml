@@ -1,0 +1,1382 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Create project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_TC'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.triggerclicker"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.triggerclicker"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_TC
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_TC'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+              <application android:label="Кликер" android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service android:name=".OverlayService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection"/>
+
+                  <service android:name=".ClickerAccessibility" android:exported="true"
+                      android:label="Кликер"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF_TC
+          mkdir -p app/src/main/java/com/example/triggerclicker
+          cat > app/src/main/java/com/example/triggerclicker/ClickerAccessibility.kt <<'EOF_TC'
+          package com.example.triggerclicker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.accessibility.AccessibilityEvent
+
+          class ClickerAccessibility : AccessibilityService() {
+              companion object {
+                  @Volatile var inst: ClickerAccessibility? = null
+              }
+
+              private val h = Handler(Looper.getMainLooper())
+
+              override fun onServiceConnected() { inst = this }
+              override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun tap(x: Float, y: Float, onResult: (Boolean) -> Unit) {
+                  h.post {
+                      val path = Path().apply { moveTo(x, y) }
+                      val g = GestureDescription.Builder()
+                          .addStroke(GestureDescription.StrokeDescription(path, 0, 40))
+                          .build()
+                      val cb = object : AccessibilityService.GestureResultCallback() {
+                          override fun onCompleted(gestureDescription: GestureDescription?) { onResult(true) }
+                          override fun onCancelled(gestureDescription: GestureDescription?) { onResult(false) }
+                      }
+                      val ok = dispatchGesture(g, cb, null)
+                      if (!ok) onResult(false)
+                  }
+              }
+          }
+          EOF_TC
+          mkdir -p app/src/main/java/com/example/triggerclicker
+          cat > app/src/main/java/com/example/triggerclicker/MainActivity.kt <<'EOF_TC'
+          package com.example.triggerclicker
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var tol: EditText
+              private lateinit var pre: EditText
+              private lateinit var cool: EditText
+              private lateinit var adapt: CheckBox
+              private lateinit var disappear: CheckBox
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val sp = getSharedPreferences("kl", MODE_PRIVATE)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  fun text(t: String) = TextView(this).apply { text = t }.also { root.addView(it) }
+                  fun field(label: String, def: String): EditText {
+                      text(label)
+                      return EditText(this).apply {
+                          setText(def); inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                      }.also { root.addView(it) }
+                  }
+                  fun btn(t: String, f: () -> Unit) =
+                      Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
+
+                  text("Кликер: нажатие в момент касания двух цветов (стрелка и зона) или по одному цвету")
+                  tol = field("Допуск цвета (0-255)", sp.getInt("tol", 25).toString())
+                  pre = field("Задержка до клика, мс", sp.getLong("pre", 0L).toString())
+                  cool = field("Пауза после нажатия, мс (для стрелки и зоны 400-800)", sp.getLong("cool", 150L).toString())
+                  adapt = CheckBox(this).apply { text = "Адаптация к задержке (повтор клика)"; isChecked = sp.getBoolean("adapt", true) }
+                  root.addView(adapt)
+                  disappear = CheckBox(this).apply { text = "Режим: кликать, когда цвет ИСЧЕЗ"; isChecked = sp.getBoolean("disappear", false) }
+                  root.addView(disappear)
+
+                  btn("1. Разрешить поверх других окон") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  btn("2. Включить «Спецвозможности» (Кликер)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  btn("3. Запустить") { launch() }
+
+                  text("\nПосле запуска появится кружок, он остаётся поверх всех приложений.\n\n" +
+                       "• Тап по кружку — старт / стоп.\n" +
+                       "• Удержание — меню: 💧 пипетка с лупой (в режиме ⚡ два шага: сначала стрелка, потом зона), " +
+                       "🎯 прицел (круг вокруг дуги), 🔍 размер кружка, ⚡ режим (два цвета / один цвет), " +
+                       "⏪ ⏩ упреждение: ⏪ жмёт раньше, ⏩ позже, ✕ выход.\n" +
+                       "• Внизу кружка при работе две точки: видно ли стрелку и зону.\n" +
+                       "• Скорость стрелки считается по каждому кадру, упреждение подстраивается само по месту остановки стрелки.\n" +
+                       "• Сохранённые цвета — точки вокруг кружка. Тап — выбрать, удержание — удалить.")
+                  setContentView(ScrollView(this).apply { addView(root) })
+
+                  if (Build.VERSION.SDK_INT >= 33)
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+              }
+
+              private fun launch() {
+                  if (!Settings.canDrawOverlays(this)) { toast("Сначала шаг 1"); return }
+                  if (ClickerAccessibility.inst == null) { toast("Сначала шаг 2"); return }
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 42)
+              }
+
+              @Deprecated("simple")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 42 && res == RESULT_OK && data != null) {
+                      val t = tol.text.toString().toIntOrNull() ?: 25
+                      val p = pre.text.toString().toLongOrNull() ?: 0L
+                      val c = cool.text.toString().toLongOrNull() ?: 150L
+                      getSharedPreferences("kl", MODE_PRIVATE).edit()
+                          .putInt("tol", t).putLong("pre", p).putLong("cool", c)
+                          .putBoolean("adapt", adapt.isChecked).putBoolean("disappear", disappear.isChecked)
+                          .apply()
+                      val i = Intent(this, OverlayService::class.java)
+                          .putExtra("code", res).putExtra("data", data)
+                          .putExtra("tol", t).putExtra("pre", p).putExtra("cool", c)
+                          .putExtra("adapt", adapt.isChecked)
+                          .putExtra("disappear", disappear.isChecked)
+                      startForegroundService(i)
+                      moveTaskToBack(true)
+                  }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          EOF_TC
+          mkdir -p app/src/main/java/com/example/triggerclicker
+          cat > app/src/main/java/com/example/triggerclicker/OverlayService.kt <<'EOF_TC'
+          package com.example.triggerclicker
+
+          import android.animation.ValueAnimator
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.content.res.Configuration
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.RectF
+          import android.graphics.drawable.GradientDrawable
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.util.DisplayMetrics
+          import android.util.TypedValue
+          import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import android.view.animation.DecelerateInterpolator
+          import android.view.animation.OvershootInterpolator
+          import android.widget.FrameLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.hypot
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          class OverlayService : Service() {
+              private class Act(val label: String, val bg: Int, val deg: Int, val onClick: () -> Unit)
+
+              private val ui = Handler(Looper.getMainLooper())
+              private lateinit var wm: WindowManager
+              private var projection: MediaProjection? = null
+              private var reader: ImageReader? = null
+              private var vd: VirtualDisplay? = null
+              private var cur: Image? = null
+              private val lock = Any()
+              private var W = 0
+              private var H = 0
+              private var dpi = 0
+
+              // круг-детектор, точка нажатия, кружок-меню (px)
+              private var fx = 300; private var fy = 300; private var fw = 160; private var fh = 160
+              private var tx = 700; private var ty = 500
+              private var hudX = Int.MIN_VALUE; private var hudY = 0
+              private var bubbleStep = 1
+              @Volatile private var offX = 0
+              @Volatile private var offY = 0
+              @Volatile private var color = Color.RED
+              @Volatile private var color2 = Color.YELLOW
+              @Volatile private var contactMode = true
+              @Volatile private var leadMs = 80
+              @Volatile private var seenN = false
+              @Volatile private var seenZ = false
+              private var pipStep = 1
+              @Volatile private var running = false
+              @Volatile private var alive = true
+              @Volatile private var lat = -1.0
+              @Volatile private var clicks = 0
+              @Volatile private var tapOk = 0
+              @Volatile private var tapFail = 0
+
+              private var tol = 25; private var pre = 0L; private var cool = 150L
+              private var adapt = true; private var wantPresent = true
+
+              // режим «контакт двух цветов»: стрелка + зона
+              private val nxs = IntArray(4000)
+              private val nys = IntArray(4000)
+              private val zxs = IntArray(8000)
+              private val zys = IntArray(8000)
+              private var rowBuf = ByteArray(4096)
+              private val histT = LongArray(6)
+              private val histG = FloatArray(6)
+              private var histN = 0
+              private var aTs = 0L
+              private var aZn = 0
+              private var aNn = 0
+              private var aZx = 0f
+              private var aZy = 0f
+              private var aRz = 0f
+              private var aGc = 0f
+              private var prevZx = -1f
+              private var prevZy = -1f
+              private var waitChange = false
+              private var lastZx = 0f
+              private var lastZy = 0f
+              private val histX = FloatArray(6)
+              private val histY = FloatArray(6)
+              private var aTipX = 0f
+              private var aTipY = 0f
+              private var fireVx = 0f
+              private var fireVy = 0f
+              private var fireZx = 0f
+              private var fireZy = 0f
+              private var calibPending = false
+              private var calStill = 0
+              private var calPx = 0f
+              private var calPy = 0f
+              private var lastSpeed = 0f
+              private var fireNs = 0L
+              private var blockUntilNs = 0L
+
+              private val palette = ArrayList<Int>()
+              private var aiming = true
+              private var expanded = false
+              private val menuViews = ArrayList<View>()
+              private var pipette: PipetteView? = null
+              private val menuClose = Runnable { collapse() }
+
+              private lateinit var frameV: View
+              private lateinit var frameP: WindowManager.LayoutParams
+              private lateinit var moveH: Handle
+              private lateinit var sizeH: Handle
+              private lateinit var targetH: Handle
+              private lateinit var hudRoot: FrameLayout
+              private lateinit var hudP: WindowManager.LayoutParams
+              private lateinit var bubble: BubbleView
+
+              private fun bubbleSize(): Int =
+                  (resources.displayMetrics.density * intArrayOf(44, 56, 72)[bubbleStep.coerceIn(0, 2)]).toInt()
+
+              private val S: Int
+                  get() = (bubbleSize() * 0.6f).toInt()
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, flags: Int, id: Int): Int {
+                  if (i == null || projection != null) return START_NOT_STICKY
+                  tol = i.getIntExtra("tol", 25)
+                  pre = i.getLongExtra("pre", 0)
+                  cool = i.getLongExtra("cool", 150)
+                  adapt = i.getBooleanExtra("adapt", true)
+                  wantPresent = !i.getBooleanExtra("disappear", false)
+                  startFg()
+                  load()
+
+                  val code = i.getIntExtra("code", 0)
+                  @Suppress("DEPRECATION")
+                  val data: Intent = (if (Build.VERSION.SDK_INT >= 33)
+                      i.getParcelableExtra("data", Intent::class.java) else i.getParcelableExtra("data")) ?: run {
+                      stopSelf(); return START_NOT_STICKY
+                  }
+                  val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(code, data).also {
+                      it.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() { ui.post { stopSelf() } }
+                      }, ui)
+                  }
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  setupCapture()
+                  if (hudX == Int.MIN_VALUE) { hudX = W - bubbleSize(); hudY = H / 3 }
+                  clampAll()
+                  buildOverlay()
+                  Thread {
+                      android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+                      loop()
+                  }.apply { isDaemon = true; start() }
+                  tickStatus()
+                  toast("Тап по кружку — старт/стоп. Удержание — меню.")
+                  return START_NOT_STICKY
+              }
+
+              private fun startFg() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("tc", "Кликер", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "tc")
+                      .setContentTitle("Кликер работает")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass).build()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  else startForeground(1, n)
+              }
+
+              private var curToast: Toast? = null
+
+              private fun toast(s: String) {
+                  ui.post {
+                      curToast?.cancel()
+                      curToast = Toast.makeText(this, s, Toast.LENGTH_SHORT)
+                      curToast?.show()
+                  }
+              }
+
+              private fun keepMenu() {
+                  ui.removeCallbacks(menuClose)
+                  ui.postDelayed(menuClose, 7000)
+              }
+
+              // ---------- сохранение настроек и палитры ----------
+              private fun prefs() = getSharedPreferences("kl", MODE_PRIVATE)
+
+              private fun load() {
+                  val p = prefs()
+                  aiming = !p.contains("fx")
+                  fx = p.getInt("fx", fx); fy = p.getInt("fy", fy); fw = p.getInt("fw", fw); fh = fw
+                  tx = p.getInt("tx", tx); ty = p.getInt("ty", ty)
+                  hudX = p.getInt("hx", Int.MIN_VALUE); hudY = p.getInt("hy", 0)
+                  bubbleStep = p.getInt("bs", 1)
+                  color = p.getInt("color", Color.RED)
+                  color2 = p.getInt("c2", Color.YELLOW)
+                  contactMode = p.getBoolean("cm", true)
+                  leadMs = p.getInt("lead", 80)
+                  palette.clear()
+                  for (s in (p.getString("pal", "") ?: "").split(",")) {
+                      val v = s.toIntOrNull()
+                      if (v != null) palette.add(v)
+                  }
+              }
+
+              private fun save() {
+                  prefs().edit()
+                      .putInt("fx", fx).putInt("fy", fy).putInt("fw", fw)
+                      .putInt("tx", tx).putInt("ty", ty)
+                      .putInt("hx", hudX).putInt("hy", hudY)
+                      .putInt("bs", bubbleStep).putInt("color", color)
+                      .putInt("c2", color2).putBoolean("cm", contactMode).putInt("lead", leadMs)
+                      .putString("pal", palette.joinToString(","))
+                      .apply()
+              }
+
+              private fun near(a: Int, b: Int): Boolean =
+                  abs(Color.red(a) - Color.red(b)) < 12 && abs(Color.green(a) - Color.green(b)) < 12 &&
+                      abs(Color.blue(a) - Color.blue(b)) < 12
+
+              private fun addPalette(c: Int) {
+                  palette.removeAll { near(it, c) }
+                  palette.add(0, c)
+                  while (palette.size > 8) palette.removeAt(palette.size - 1)
+              }
+
+              // ---------- захват экрана ----------
+              @Suppress("DEPRECATION")
+              private fun setupCapture() {
+                  val dm = DisplayMetrics()
+                  (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+                  val oldW = W
+                  val oldH = H
+                  W = dm.widthPixels; H = dm.heightPixels; dpi = dm.densityDpi
+                  synchronized(lock) { cur?.close(); cur = null }
+                  val old = reader
+                  reader = ImageReader.newInstance(W, H, PixelFormat.RGBA_8888, 3)
+                  if (vd == null) {
+                      vd = projection!!.createVirtualDisplay("tc", W, H, dpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, null)
+                  } else {
+                      vd!!.resize(W, H, dpi)
+                      vd!!.surface = reader!!.surface
+                  }
+                  old?.close()
+
+                  // при повороте экрана переносим всё в видимую область
+                  if (oldW > 0 && (oldW != W || oldH != H) && ::hudRoot.isInitialized) {
+                      collapse(false)
+                      fx = fx * W / oldW; fy = fy * H / oldH
+                      tx = tx * W / oldW; ty = ty * H / oldH
+                      hudX = hudX * W / oldW; hudY = hudY * H / oldH
+                      clampAll()
+                      hudX = if (hudX + bubbleSize() / 2 < W / 2) 0 else W - bubbleSize()
+                      relayoutAll()
+                  }
+              }
+
+              private fun clampAll() {
+                  val b = bubbleSize()
+                  fw = fw.coerceIn(60, max(60, W - 2 * S))
+                  fh = fh.coerceIn(60, max(60, H - 2 * S))
+                  fx = fx.coerceIn(S, max(S, W - fw - S))
+                  fy = fy.coerceIn(S, max(S, H - fh - S))
+                  tx = tx.coerceIn(S / 2, max(S / 2, W - S / 2))
+                  ty = ty.coerceIn(S / 2, max(S / 2, H - S / 2))
+                  val sq = min(fw, fh)
+                  fw = sq; fh = sq
+                  hudX = hudX.coerceIn(0, max(0, W - b))
+                  hudY = hudY.coerceIn(0, max(0, H - b))
+              }
+
+              override fun onConfigurationChanged(c: Configuration) {
+                  super.onConfigurationChanged(c)
+                  if (projection != null) ui.postDelayed({ setupCapture() }, 300)
+              }
+
+              private fun refresh() {
+                  val n = try { reader?.acquireLatestImage() } catch (e: Exception) { null }
+                  if (n != null) { cur?.close(); cur = n }
+              }
+
+              private fun px(x: Int, y: Int): Int {
+                  val im = cur ?: return 0
+                  if (x < 0 || y < 0 || x >= im.width || y >= im.height) return 0
+                  val p = im.planes[0]
+                  val o = y * p.rowStride + x * p.pixelStride
+                  val b = p.buffer
+                  if (o + 2 >= b.limit()) return 0
+                  return Color.rgb(b.get(o).toInt() and 255, b.get(o + 1).toInt() and 255, b.get(o + 2).toInt() and 255)
+              }
+
+              private fun vivid(c: Int): Float {
+                  val r = Color.red(c)
+                  val g = Color.green(c)
+                  val b = Color.blue(c)
+                  val mx = max(r, max(g, b))
+                  val mn = min(r, min(g, b))
+                  if (mx == 0) return 0f
+                  return (mx - mn) / mx.toFloat() * (mx / 255f)
+              }
+
+              // берёт самый яркий и насыщенный пиксель рядом: так можно попасть в тонкую линию
+              private fun smartPick(x: Int, y: Int): Int = synchronized(lock) {
+                  refresh()
+                  val center = px(x, y)
+                  if (center == 0) return 0
+                  var best = center
+                  var bestV = vivid(center)
+                  for (dy in -2..2) for (dx in -2..2) {
+                      val p = px(x + dx, y + dy)
+                      if (p == 0) continue
+                      val v = vivid(p)
+                      if (v > bestV) { bestV = v; best = p }
+                  }
+                  if (vivid(center) >= bestV * 0.85f) center else best
+              }
+
+              private fun grid(x: Int, y: Int, n: Int): IntArray = synchronized(lock) {
+                  refresh()
+                  IntArray(n * n) { i -> px(x + i % n - n / 2, y + i / n - n / 2) }
+              }
+
+              private fun match(): Boolean = synchronized(lock) {
+                  refresh()
+                  if (cur == null) return false
+                  val bx = fx + offX
+                  val by = fy + offY
+                  val inset = 6
+                  val nx = (fw - 2 * inset).coerceIn(8, 40) / 5
+                  val ny = (fh - 2 * inset).coerceIn(8, 40) / 5
+                  val c = color
+                  val ccx = bx + fw / 2.0
+                  val ccy = by + fh / 2.0
+                  val rr = (fw - 2 * inset) / 2.0
+                  for (i in 0..max(1, nx)) for (j in 0..max(1, ny)) {
+                      val x = bx + inset + (fw - 2 * inset - 1) * i / max(1, nx)
+                      val y = by + inset + (fh - 2 * inset - 1) * j / max(1, ny)
+                      val ddx = x - ccx
+                      val ddy = y - ccy
+                      if (ddx * ddx + ddy * ddy > rr * rr) continue
+                      val p = px(x, y)
+                      if (abs(Color.red(p) - Color.red(c)) <= tol && abs(Color.green(p) - Color.green(c)) <= tol &&
+                          abs(Color.blue(p) - Color.blue(c)) <= tol) return true
+                  }
+                  false
+              }
+
+              // ---------- движок ----------
+              private fun click() {
+                  val s = ClickerAccessibility.inst ?: return
+                  clicks++
+                  s.tap((tx + offX).toFloat(), (ty + offY).toFloat()) { ok ->
+                      if (ok) { tapOk++ } else { tapFail++ }
+                  }
+              }
+
+              private fun loop() {
+                  while (alive) {
+                      if (!running) { Thread.sleep(20); continue }
+                      try {
+                          if (contactMode) tickContact() else { tick(); Thread.sleep(1) }
+                      } catch (e: Exception) { Thread.sleep(50) }
+                  }
+              }
+
+              private fun tick() {
+                  val want = wantPresent
+                  if (match() != want) return
+                  if (pre > 0) Thread.sleep(pre)
+                  var retries = 0
+                  while (running) {
+                      val t0 = System.nanoTime()
+                      click()
+                      if (!adapt) break
+                      val timeout = if (lat > 0) (lat * 1.6 + 20).coerceIn(40.0, 500.0) else 150.0
+                      var ok = false
+                      while ((System.nanoTime() - t0) / 1e6 < timeout) {
+                          if (match() != want) { ok = true; break }
+                          Thread.sleep(1)
+                      }
+                      if (ok) {
+                          val d = (System.nanoTime() - t0) / 1e6
+                          lat = if (lat < 0) d else lat * 0.8 + d * 0.2
+                          break
+                      }
+                      if (++retries >= 3) break
+                  }
+                  while (running && match() == want) Thread.sleep(2)
+                  Thread.sleep(cool)
+              }
+
+
+              // ---------- контакт двух цветов: стрелка + зона ----------
+              private fun analyzeFrame(): Int = synchronized(lock) {
+                  val n = try { reader?.acquireLatestImage() } catch (e: Exception) { null }
+                  if (n == null) return 0
+                  cur?.close(); cur = n
+                  val pl = n.planes[0]
+                  val buf = pl.buffer
+                  val rs = pl.rowStride
+                  val ps = pl.pixelStride
+                  val bx = fx + offX
+                  val by = fy + offY
+                  val x0 = max(0, bx)
+                  val y0 = max(0, by)
+                  val x1 = min(n.width, bx + fw)
+                  val y1 = min(n.height, by + fh)
+                  aTs = n.timestamp
+                  aNn = 0; aZn = 0
+                  if (x1 - x0 < 8 || y1 - y0 < 8) return 1
+                  val need = (x1 - x0) * ps
+                  if (rowBuf.size < need) rowBuf = ByteArray(need)
+
+                  val t = max(tol, 40)
+                  val ar = Color.red(color); val ag = Color.green(color); val ab = Color.blue(color)
+                  val c2 = color2
+                  val br = Color.red(c2); val bg = Color.green(c2); val bb = Color.blue(c2)
+                  val cxm = bx + fw / 2f
+                  val cym = by + fh / 2f
+                  val rad = fw / 2f - 2f
+                  val rad2 = rad * rad
+                  var nn = 0
+                  var nz = 0
+                  for (y in y0 until y1) {
+                      val dy = y - cym
+                      val hw2 = rad2 - dy * dy
+                      if (hw2 < 0f) continue
+                      val hw = sqrt(hw2)
+                      val xa = max(x0, (cxm - hw).toInt())
+                      val xb = min(x1 - 1, (cxm + hw).toInt())
+                      if (xb <= xa) continue
+                      val off = y * rs + xa * ps
+                      val len = (xb - xa + 1) * ps
+                      if (off + len > buf.limit()) break
+                      buf.position(off)
+                      buf.get(rowBuf, 0, len)
+                      var o = 0
+                      var x = xa
+                      while (x <= xb) {
+                          val r = rowBuf[o].toInt() and 255
+                          val g = rowBuf[o + 1].toInt() and 255
+                          val b = rowBuf[o + 2].toInt() and 255
+                          if (abs(r - ar) <= t && abs(g - ag) <= t && abs(b - ab) <= t) {
+                              if (nn < nxs.size) { nxs[nn] = x; nys[nn] = y; nn++ }
+                          } else if (abs(r - br) <= t && abs(g - bg) <= t && abs(b - bb) <= t) {
+                              if (nz < zxs.size) { zxs[nz] = x; zys[nz] = y; nz++ }
+                          }
+                          o += ps
+                          x++
+                      }
+                  }
+                  aNn = nn; aZn = nz
+                  if (nz >= 25) {
+                      // грубый центр зоны, потом отбрасываем одиночные пиксели-помехи
+                      var sx = 0L; var sy = 0L
+                      for (i in 0 until nz) { sx += zxs[i]; sy += zys[i] }
+                      var cx = sx.toFloat() / nz
+                      var cy = sy.toFloat() / nz
+                      var sd = 0f
+                      for (i in 0 until nz) sd += hypot(zxs[i] - cx, zys[i] - cy)
+                      val lim = 2f * (sd / nz) + 5f
+                      var sx2 = 0L; var sy2 = 0L; var n2 = 0
+                      for (i in 0 until nz) {
+                          if (hypot(zxs[i] - cx, zys[i] - cy) <= lim) { sx2 += zxs[i]; sy2 += zys[i]; n2++ }
+                      }
+                      if (n2 >= 10) { cx = sx2.toFloat() / n2; cy = sy2.toFloat() / n2 }
+                      var rz = 0f
+                      for (i in 0 until nz) {
+                          val d = hypot(zxs[i] - cx, zys[i] - cy)
+                          if (d <= lim && d > rz) rz = d
+                      }
+                      aZx = cx; aZy = cy; aRz = rz
+                      if (nn >= 2) {
+                          var g2 = Float.MAX_VALUE
+                          var bi = 0
+                          for (i in 0 until nn) {
+                              val ddx = nxs[i] - cx
+                              val ddy = nys[i] - cy
+                              val d2 = ddx * ddx + ddy * ddy
+                              if (d2 < g2) { g2 = d2; bi = i }
+                          }
+                          aGc = sqrt(g2)
+                          aTipX = nxs[bi].toFloat(); aTipY = nys[bi].toFloat()
+                      }
+                  }
+                  1
+              }
+
+              private fun tickContact() {
+                  if (analyzeFrame() == 0) { Thread.sleep(1); return }
+                  val nowNs = System.nanoTime()
+                  seenN = aNn >= 2
+                  seenZ = aZn >= 25
+
+                  // самонастройка: после нажатия стрелка замирает, по месту остановки уточняем упреждение
+                  if (calibPending) {
+                      val dtMs = (nowNs - fireNs) / 1e6
+                      if (dtMs > 700 || !seenZ) {
+                          calibPending = false
+                      } else if (seenN && dtMs > 25) {
+                          if (hypot(aTipX - calPx, aTipY - calPy) < 1.5f) { calStill++ } else { calStill = 0 }
+                          calPx = aTipX; calPy = aTipY
+                          if (calStill >= 2) {
+                              calibPending = false
+                              val sp = hypot(fireVx, fireVy)
+                              if (sp > 30f) {
+                                  val sgn = ((fireZx - aTipX) * fireVx + (fireZy - aTipY) * fireVy) / sp
+                                  val errMs = sgn / sp * 1000.0
+                                  if (abs(errMs) < 150.0) {
+                                      leadMs = (leadMs - errMs * 0.5).toInt().coerceIn(0, 250)
+                                      save()
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  // после нажатия ждём новую зону
+                  if (waitChange) {
+                      val moved = seenZ && hypot(aZx - lastZx, aZy - lastZy) > 25f
+                      val dtMs = (nowNs - fireNs) / 1e6
+                      if (!seenZ || moved) {
+                          if (dtMs < 1500) lat = if (lat < 0) dtMs else lat * 0.7 + dtMs * 0.3
+                          waitChange = false; histN = 0
+                      } else if (dtMs > 3000) {
+                          waitChange = false; histN = 0
+                      } else return
+                  }
+                  if (nowNs < blockUntilNs) return
+                  if (!seenZ) { histN = 0; prevZx = -1f; return }
+                  if (prevZx >= 0f && hypot(aZx - prevZx, aZy - prevZy) > 30f) histN = 0
+                  prevZx = aZx; prevZy = aZy
+                  if (!seenN) return
+
+                  // история кадров: расстояние от кончика стрелки до центра зоны
+                  val t = if (aTs > 0) aTs else nowNs
+                  if (histN > 0 && abs(aGc - histG[histN - 1]) > 120f) histN = 0
+                  if (histN == histT.size) {
+                      for (i in 1 until histT.size) {
+                          histT[i - 1] = histT[i]; histG[i - 1] = histG[i]
+                          histX[i - 1] = histX[i]; histY[i - 1] = histY[i]
+                      }
+                      histN--
+                  }
+                  histT[histN] = t; histG[histN] = aGc; histX[histN] = aTipX; histY[histN] = aTipY
+                  histN++
+
+                  // скорость стрелки считается заново по каждому кадру, поэтому любая из пяти скоростей подхватывается сразу
+                  val k = min(histN, 4)
+                  var approach = 0.0
+                  var vx = 0f
+                  var vy = 0f
+                  if (k >= 3) {
+                      val s0 = histN - k
+                      var mt = 0.0; var mg = 0.0
+                      for (i in 0 until k) { mt += histT[s0 + i]; mg += histG[s0 + i] }
+                      mt /= k; mg /= k
+                      var num = 0.0; var den = 0.0
+                      for (i in 0 until k) {
+                          val dt = (histT[s0 + i] - mt) / 1e9
+                          num += dt * (histG[s0 + i] - mg); den += dt * dt
+                      }
+                      if (den > 0) approach = -num / den
+                      val dtS = (histT[histN - 1] - histT[s0]) / 1e9f
+                      if (dtS > 0f) {
+                          vx = (histX[histN - 1] - histX[s0]) / dtS
+                          vy = (histY[histN - 1] - histY[s0]) / dtS
+                      }
+                  }
+                  lastSpeed = hypot(vx, vy)
+
+                  // возраст кадра: пока мы его разбирали, стрелка уже сдвинулась
+                  val ageRaw = (nowNs - aTs) / 1e6
+                  val age = if (ageRaw in 0.0..120.0) ageRaw else 0.0
+
+                  // жмём, когда за время упреждения стрелка дойдёт до центра зоны
+                  val core = aGc <= aRz * 0.5f
+                  val predicted = approach > 20.0 && aGc / approach * 1000.0 <= leadMs + age &&
+                      aGc <= max(aRz * 3f, (approach * 0.35).toFloat())
+                  if (core || predicted) {
+                      click()
+                      fireNs = System.nanoTime()
+                      blockUntilNs = fireNs + max(cool, 300L) * 1_000_000L
+                      waitChange = true; lastZx = aZx; lastZy = aZy; histN = 0
+                      fireVx = vx; fireVy = vy; fireZx = aZx; fireZy = aZy
+                      calibPending = true; calStill = 0; calPx = aTipX; calPy = aTipY
+                  }
+              }
+
+              // ---------- окна ----------
+              // alpha < 0.8: Android 12+ блокирует нажатия сквозь окна непрозрачнее 0.8
+              private fun lp(w: Int, h: Int, touch: Boolean, x: Int, y: Int): WindowManager.LayoutParams {
+                  val q = WindowManager.LayoutParams(
+                      w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          (if (touch) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+                      PixelFormat.TRANSLUCENT)
+                  q.gravity = Gravity.TOP or Gravity.START
+                  q.x = x
+                  q.y = y
+                  q.alpha = 0.7f
+                  if (Build.VERSION.SDK_INT >= 28)
+                      q.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  return q
+              }
+
+              // точки для прицеливания (двигать круг, менять размер, место нажатия)
+              private inner class Handle(col: Int, var x: Int, var y: Int, val onMove: (Int, Int) -> Unit) {
+                  val v = View(this@OverlayService).apply {
+                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col); setStroke(5, Color.WHITE) }
+                  }
+                  val p = lp(S, S, true, x, y)
+                  var attached = false
+                  init {
+                      var sx = 0f; var sy = 0f; var ox = 0; var oy = 0
+                      v.setOnTouchListener { _, e ->
+                          when (e.action) {
+                              MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = x; oy = y }
+                              MotionEvent.ACTION_MOVE -> {
+                                  moveTo(ox + (e.rawX - sx).toInt(), oy + (e.rawY - sy).toInt()); onMove(x, y)
+                              }
+                              MotionEvent.ACTION_UP -> save()
+                          }
+                          true
+                      }
+                  }
+                  fun show() { if (!attached) { try { wm.addView(v, p); attached = true } catch (e: Exception) {} } }
+                  fun hide() { if (attached) { try { wm.removeView(v) } catch (e: Exception) {}; attached = false } }
+                  fun moveTo(nx: Int, ny: Int) { x = nx; y = ny; p.x = nx; p.y = ny; if (attached) wm.updateViewLayout(v, p) }
+                  fun resize() { p.width = S; p.height = S }
+              }
+
+              private fun relayout() {
+                  frameP.x = fx; frameP.y = fy; frameP.width = fw; frameP.height = fh
+                  wm.updateViewLayout(frameV, frameP)
+                  val r = fw / 2
+                  val k = (r * 0.707f).toInt()
+                  moveH.moveTo(fx + r - k - S / 2, fy + r - k - S / 2)
+                  sizeH.moveTo(fx + r + k - S / 2, fy + r + k - S / 2)
+              }
+
+              private fun relayoutAll() {
+                  relayout()
+                  targetH.moveTo(tx - S / 2, ty - S / 2)
+                  if (!expanded) {
+                      hudP.x = hudX; hudP.y = hudY
+                      hudP.width = bubbleSize(); hudP.height = bubbleSize()
+                      wm.updateViewLayout(hudRoot, hudP)
+                  }
+              }
+
+              private fun applyAim() {
+                  if (aiming && !running) {
+                      moveH.show(); sizeH.show(); targetH.show()
+                      relayoutAll()
+                  } else {
+                      moveH.hide(); sizeH.hide(); targetH.hide()
+                  }
+              }
+
+              private fun aimAction() {
+                  if (running) toggle()
+                  aiming = !aiming
+                  applyAim()
+                  collapse()
+              }
+
+              private fun cycleSize() {
+                  collapse(false)
+                  bubbleStep = (bubbleStep + 1) % 3
+                  val b = bubbleSize()
+                  val q = bubble.layoutParams as FrameLayout.LayoutParams
+                  q.width = b; q.height = b
+                  bubble.layoutParams = q
+                  moveH.resize(); sizeH.resize(); targetH.resize()
+                  clampAll()
+                  relayoutAll()
+                  save()
+              }
+
+              // ---------- кружок ----------
+              private inner class BubbleView : View(this@OverlayService) {
+                  private val pr = Paint(Paint.ANTI_ALIAS_FLAG)
+                  private var phase = 0f
+                  private val anim = ValueAnimator.ofFloat(0f, 1f).apply {
+                      duration = 1000
+                      repeatCount = ValueAnimator.INFINITE
+                      addUpdateListener { phase = it.animatedValue as Float; invalidate() }
+                  }
+
+                  fun sync() {
+                      if (running) { if (!anim.isRunning) anim.start() } else { anim.cancel(); phase = 0f; invalidate() }
+                  }
+
+                  override fun onDetachedFromWindow() { anim.cancel(); super.onDetachedFromWindow() }
+
+                  override fun onDraw(c: Canvas) {
+                      val w = width.toFloat()
+                      val m = w / 2f
+                      val base = m * 0.80f
+                      val green = Color.parseColor("#00E676")
+                      if (running) {
+                          pr.style = Paint.Style.STROKE; pr.strokeWidth = m * 0.10f; pr.color = green
+                          pr.alpha = (200 * (1f - phase)).toInt()
+                          c.drawCircle(m, m, base + (m - base) * phase, pr)
+                      }
+                      pr.style = Paint.Style.FILL; pr.color = Color.parseColor("#F2151A21")
+                      c.drawCircle(m, m, base, pr)
+                      pr.style = Paint.Style.STROKE; pr.strokeWidth = m * 0.10f
+                      pr.color = if (running) green else Color.WHITE
+                      c.drawCircle(m, m, base, pr)
+                      val col = color
+                      pr.style = Paint.Style.FILL
+                      if (contactMode) {
+                          val rc = RectF(m - base * 0.58f, m - base * 0.58f, m + base * 0.58f, m + base * 0.58f)
+                          pr.color = col; c.drawArc(rc, 90f, 180f, true, pr)
+                          pr.color = color2; c.drawArc(rc, -90f, 180f, true, pr)
+                      } else {
+                          pr.color = col
+                          c.drawCircle(m, m, base * 0.58f, pr)
+                      }
+                      val lum = Color.red(col) * 0.3 + Color.green(col) * 0.6 + Color.blue(col) * 0.1
+                      pr.color = if (lum > 140) Color.BLACK else Color.WHITE
+                      if (running) {
+                          val s = base * 0.22f
+                          c.drawRoundRect(RectF(m - s, m - s, m + s, m + s), s * 0.25f, s * 0.25f, pr)
+                      } else {
+                          val s = base * 0.26f
+                          val path = Path()
+                          path.moveTo(m - s * 0.7f, m - s)
+                          path.lineTo(m + s, m)
+                          path.lineTo(m - s * 0.7f, m + s)
+                          path.close()
+                          c.drawPath(path, pr)
+                      }
+                      if (running && contactMode) {
+                          pr.style = Paint.Style.FILL
+                          pr.color = if (seenN) color else Color.DKGRAY
+                          c.drawCircle(m - m * 0.28f, w * 0.93f, m * 0.13f, pr)
+                          pr.color = if (seenZ) color2 else Color.DKGRAY
+                          c.drawCircle(m + m * 0.28f, w * 0.93f, m * 0.13f, pr)
+                      }
+                      if (ClickerAccessibility.inst == null) {
+                          pr.style = Paint.Style.FILL; pr.color = Color.parseColor("#E53935")
+                          c.drawCircle(w * 0.84f, w * 0.16f, m * 0.24f, pr)
+                          pr.style = Paint.Style.STROKE; pr.strokeWidth = m * 0.05f; pr.color = Color.WHITE
+                          c.drawCircle(w * 0.84f, w * 0.16f, m * 0.24f, pr)
+                      }
+                  }
+              }
+
+              private fun attachBubbleTouch(v: View) {
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+                  var downX = 0f; var downY = 0f; var sx = 0; var sy = 0
+                  var moved = false
+                  var longDone = false
+                  val longRun = Runnable {
+                      longDone = true
+                      v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                      if (expanded) collapse() else expand()
+                  }
+                  v.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX; downY = e.rawY; sx = hudX; sy = hudY
+                              moved = false; longDone = false
+                              ui.postDelayed(longRun, 380)
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - downX
+                              val dy = e.rawY - downY
+                              if (!moved && (abs(dx) > slop || abs(dy) > slop)) { moved = true; ui.removeCallbacks(longRun) }
+                              if (moved && !expanded) {
+                                  hudX = sx + dx.toInt(); hudY = sy + dy.toInt()
+                                  hudP.x = hudX; hudP.y = hudY
+                                  wm.updateViewLayout(hudRoot, hudP)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              ui.removeCallbacks(longRun)
+                              if (moved && !expanded) snap()
+                              else if (!moved && !longDone) { if (expanded) collapse() else toggle() }
+                          }
+                          MotionEvent.ACTION_CANCEL -> ui.removeCallbacks(longRun)
+                      }
+                      true
+                  }
+              }
+
+              // прилипание кружка к краю экрана
+              private fun snap() {
+                  val b = bubbleSize()
+                  val targetX = if (hudX + b / 2 < W / 2) 0 else W - b
+                  val targetY = hudY.coerceIn(0, max(0, H - b))
+                  val fromX = hudX
+                  val fromY = hudY
+                  ValueAnimator.ofFloat(0f, 1f).apply {
+                      duration = 220
+                      interpolator = DecelerateInterpolator()
+                      addUpdateListener {
+                          val t = it.animatedValue as Float
+                          hudX = (fromX + (targetX - fromX) * t).toInt()
+                          hudY = (fromY + (targetY - fromY) * t).toInt()
+                          if (!expanded) {
+                              hudP.x = hudX; hudP.y = hudY
+                              try { wm.updateViewLayout(hudRoot, hudP) } catch (e: Exception) {}
+                          }
+                      }
+                      start()
+                  }
+                  save()
+              }
+
+              private fun roundBtn(label: String, bg: Int, size: Int): TextView {
+                  val t = TextView(this)
+                  t.text = label
+                  t.gravity = Gravity.CENTER
+                  t.setTextColor(Color.WHITE)
+                  t.setTextSize(TypedValue.COMPLEX_UNIT_PX, size * 0.46f)
+                  t.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(bg); setStroke(3, Color.WHITE) }
+                  t.layoutParams = FrameLayout.LayoutParams(size, size, Gravity.CENTER)
+                  return t
+              }
+
+              private fun addMenu(v: View, mx: Float, my: Float, i: Int, onClick: () -> Unit, onLong: (() -> Unit)?) {
+                  v.scaleX = 0f; v.scaleY = 0f; v.alpha = 0f
+                  v.setOnClickListener {
+                      v.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                      onClick()
+                  }
+                  if (onLong != null) v.setOnLongClickListener { onLong(); true }
+                  hudRoot.addView(v)
+                  menuViews.add(v)
+                  v.animate().translationX(mx).translationY(my).scaleX(1f).scaleY(1f).alpha(1f)
+                      .setStartDelay(i * 22L).setDuration(240).setInterpolator(OvershootInterpolator(1.4f)).start()
+              }
+
+              private fun expand() {
+                  if (expanded) return
+                  expanded = true
+                  val b = bubbleSize()
+                  val m = (b * 4.9f).toInt()
+                  val cx = (hudX + b / 2).coerceIn(m / 2, max(m / 2, W - m / 2))
+                  val cy = (hudY + b / 2).coerceIn(m / 2, max(m / 2, H - m / 2))
+                  hudP.width = m; hudP.height = m
+                  hudP.x = cx - m / 2; hudP.y = cy - m / 2
+                  wm.updateViewLayout(hudRoot, hudP)
+
+                  val a = (b * 0.78f).toInt()
+                  val d = (b * 0.6f).toInt()
+                  val r1 = b * 1.35f
+                  val r2 = b * 2.05f
+                  val acts = listOf(
+                      Act("💧", Color.parseColor("#1E88E5"), -135) { startPipette() },
+                      Act("🎯", Color.parseColor("#43A047"), -45) { aimAction() },
+                      Act("🔍", Color.parseColor("#8E24AA"), 135) { cycleSize() },
+                      Act("✕", Color.parseColor("#E53935"), 45) { stopSelf() },
+                      Act(if (contactMode) "⚡" else "◉", Color.parseColor("#F9A825"), 90) {
+                          contactMode = !contactMode
+                          save(); bubble.invalidate()
+                          toast(if (contactMode) "Режим: контакт двух цветов (стрелка + зона)" else "Режим: один цвет")
+                          collapse()
+                      },
+                      Act("⏪", Color.parseColor("#FB8C00"), 180) {
+                          leadMs = min(300, leadMs + 10); save()
+                          toast("Упреждение $leadMs мс — жмёт раньше"); keepMenu()
+                      },
+                      Act("⏩", Color.parseColor("#FB8C00"), 0) {
+                          leadMs = max(0, leadMs - 10); save()
+                          toast("Упреждение $leadMs мс — жмёт позже"); keepMenu()
+                      }
+                  )
+                  var i = 0
+                  for (act in acts) {
+                      val v = roundBtn(act.label, act.bg, a)
+                      val rad = Math.toRadians(act.deg.toDouble())
+                      addMenu(v, (r1 * cos(rad)).toFloat(), (r1 * sin(rad)).toFloat(), i++, { act.onClick() }, null)
+                  }
+                  for ((k, c) in palette.withIndex()) {
+                      val v = roundBtn("", c, d)
+                      (v.background as GradientDrawable).setStroke(if (c == color) 8 else 3, Color.WHITE)
+                      val rad = Math.toRadians(-90.0 + k * 45.0)
+                      addMenu(v, (r2 * cos(rad)).toFloat(), (r2 * sin(rad)).toFloat(), i++,
+                          { color = c; save(); bubble.invalidate(); collapse() },
+                          { palette.removeAll { it == c }; save(); collapse(false); expand() })
+                  }
+                  bubble.bringToFront()
+                  keepMenu()
+              }
+
+              private fun collapse(animated: Boolean = true) {
+                  if (!expanded) return
+                  expanded = false
+                  ui.removeCallbacks(menuClose)
+                  val finish = Runnable {
+                      if (!expanded) {
+                          for (v in menuViews) hudRoot.removeView(v)
+                          menuViews.clear()
+                          hudP.width = bubbleSize(); hudP.height = bubbleSize()
+                          hudP.x = hudX; hudP.y = hudY
+                          try { wm.updateViewLayout(hudRoot, hudP) } catch (e: Exception) {}
+                      }
+                  }
+                  if (!animated || menuViews.isEmpty()) { finish.run(); return }
+                  for (v in menuViews)
+                      v.animate().translationX(0f).translationY(0f).scaleX(0f).scaleY(0f).alpha(0f)
+                          .setStartDelay(0).setDuration(140).start()
+                  ui.postDelayed(finish, 160)
+              }
+
+              // ---------- пипетка с лупой ----------
+              private inner class PipetteView : View(this@OverlayService) {
+                  private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  private var fxp = -1f
+                  private var fyp = -1f
+                  private var cc = 0
+                  private var cells: IntArray? = null
+
+                  override fun onDraw(c: Canvas) {
+                      val d = resources.displayMetrics.density
+                      val w = width.toFloat()
+                      val hint = if (!contactMode) "Коснись нужного цвета и отпусти"
+                          else if (pipStep == 1) "1 из 2: коснись СТРЕЛКИ (тонкой линии)"
+                          else "2 из 2: коснись ЗОНЫ (подсвеченной области)"
+                      p.textSize = 14 * d; p.textAlign = Paint.Align.CENTER
+                      val tw = p.measureText(hint)
+                      p.style = Paint.Style.FILL; p.color = Color.parseColor("#CC000000")
+                      c.drawRoundRect(RectF(w / 2f - tw / 2f - 20 * d, 40 * d, w / 2f + tw / 2f + 20 * d, 84 * d), 22 * d, 22 * d, p)
+                      p.color = Color.WHITE
+                      c.drawText(hint, w / 2f, 68 * d, p)
+                      p.color = Color.parseColor("#CCE53935")
+                      c.drawCircle(w - 40 * d, 62 * d, 24 * d, p)
+                      p.color = Color.WHITE; p.textSize = 20 * d
+                      c.drawText("✕", w - 40 * d, 69 * d, p)
+
+                      val g = cells
+                      if (fxp >= 0f && g != null) {
+                          val n = 11
+                          val cs = 9 * d
+                          val size = n * cs
+                          var top = fyp - 140 * d - size / 2f
+                          if (top < 100 * d) top = fyp + 70 * d
+                          val left = (fxp - size / 2f).coerceIn(8 * d, w - size - 8 * d)
+                          p.style = Paint.Style.FILL; p.color = Color.parseColor("#EE000000")
+                          c.drawRect(left - 3 * d, top - 3 * d, left + size + 3 * d, top + size + 3 * d, p)
+                          for (i in 0 until n * n) {
+                              val v = g[i]
+                              p.color = if (v == 0) Color.DKGRAY else v
+                              val cx0 = left + (i % n) * cs
+                              val cy0 = top + (i / n) * cs
+                              c.drawRect(cx0, cy0, cx0 + cs, cy0 + cs, p)
+                          }
+                          val mc = n / 2
+                          p.style = Paint.Style.STROKE; p.strokeWidth = 2 * d; p.color = Color.WHITE
+                          c.drawRect(left + mc * cs, top + mc * cs, left + (mc + 1) * cs, top + (mc + 1) * cs, p)
+                          p.style = Paint.Style.FILL; p.color = cc
+                          c.drawCircle(left + size / 2f, top + size + 26 * d, 16 * d, p)
+                          p.style = Paint.Style.STROKE; p.color = Color.WHITE
+                          c.drawCircle(left + size / 2f, top + size + 26 * d, 16 * d, p)
+                          c.drawCircle(fxp, fyp, 14 * d, p)
+                      }
+                  }
+
+                  override fun onTouchEvent(e: MotionEvent): Boolean {
+                      val d = resources.displayMetrics.density
+                      val rx = e.rawX.toInt()
+                      val ry = e.rawY.toInt()
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                              fxp = e.x; fyp = e.y
+                              cells = grid(rx, ry, 11)
+                              cc = smartPick(rx, ry)
+                              invalidate()
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              val cancel = e.x > width - 80 * d && e.y < 110 * d
+                              val got = smartPick(rx, ry)
+                              ui.post { endPipette(if (cancel) null else got) }
+                          }
+                      }
+                      return true
+                  }
+              }
+
+              private fun startPipette() {
+                  if (pipette != null) return
+                  collapse(false)
+                  pipStep = 1
+                  val v = PipetteView()
+                  pipette = v
+                  val q = lp(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, true, 0, 0)
+                  q.alpha = 0.78f
+                  try { wm.addView(v, q) } catch (e: Exception) { pipette = null; return }
+                  ui.postDelayed({ if (pipette === v) closePipette() }, 30000)
+              }
+
+              private fun closePipette() {
+                  val v = pipette ?: return
+                  pipette = null
+                  try { wm.removeView(v) } catch (e: Exception) {}
+              }
+
+              private fun endPipette(c: Int?) {
+                  val v = pipette ?: return
+                  if (c == null) { closePipette(); return }
+                  if (c == 0) { toast("Не удалось взять цвет, попробуй ещё раз"); return }
+                  addPalette(c)
+                  if (!contactMode) {
+                      color = c
+                      closePipette()
+                      toast("Цвет сохранён и выбран")
+                  } else if (pipStep == 1) {
+                      color = c
+                      pipStep = 2
+                      v.invalidate()
+                      toast("Стрелка выбрана. Теперь коснись зоны")
+                  } else {
+                      color2 = c
+                      closePipette()
+                      toast("Готово: стрелка и зона выбраны")
+                  }
+                  save()
+                  bubble.invalidate()
+              }
+
+              // ---------- сборка интерфейса ----------
+              private fun buildOverlay() {
+                  frameV = View(this).apply {
+                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(4, Color.parseColor("#00FF66")) }
+                  }
+                  frameP = lp(fw, fh, false, fx, fy)
+                  wm.addView(frameV, frameP)
+
+                  moveH = Handle(Color.parseColor("#00CC55"), fx, fy) { x, y ->
+                      val r = fw / 2
+                      val k = (r * 0.707f).toInt()
+                      fx = x + S / 2 + k - r; fy = y + S / 2 + k - r; relayout()
+                  }
+                  sizeH = Handle(Color.WHITE, fx, fy) { x, y ->
+                      val r = ((x + S / 2 - fx) + (y + S / 2 - fy)) / 3.4f
+                      val d = max(60, (r * 2).toInt())
+                      fw = d; fh = d; relayout()
+                  }
+                  targetH = Handle(Color.parseColor("#FF9900"), tx - S / 2, ty - S / 2) { x, y -> tx = x + S / 2; ty = y + S / 2 }
+
+                  bubble = BubbleView()
+                  hudRoot = FrameLayout(this)
+                  hudRoot.addView(bubble, FrameLayout.LayoutParams(bubbleSize(), bubbleSize(), Gravity.CENTER))
+                  attachBubbleTouch(bubble)
+                  hudRoot.setOnTouchListener { _, e ->
+                      if (e.action == MotionEvent.ACTION_OUTSIDE) collapse()
+                      false
+                  }
+                  hudP = lp(bubbleSize(), bubbleSize(), true, hudX, hudY)
+                  hudP.flags = hudP.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                      WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+                  hudP.alpha = 0.78f
+                  wm.addView(hudRoot, hudP)
+                  applyAim()
+              }
+
+              // разница между координатами окна и экрана (вырез камеры и т.п.)
+              private fun syncPos() {
+                  val a = IntArray(2)
+                  frameV.getLocationOnScreen(a)
+                  val dx = a[0] - frameP.x
+                  val dy = a[1] - frameP.y
+                  if (abs(dx) < 300 && abs(dy) < 300) { offX = dx; offY = dy }
+              }
+
+              private fun toggle() {
+                  syncPos()
+                  running = !running
+                  bubble.sync()
+                  bubble.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                  if (running) {
+                      histN = 0; waitChange = false; blockUntilNs = 0L; prevZx = -1f
+                      seenN = false; seenZ = false
+                      aiming = false
+                      applyAim()
+                  } else {
+                      val l = if (lat > 0) lat.toInt().toString() + " мс" else "—"
+                      toast("Стоп. Нажатий: $clicks (ок $tapOk, отказ $tapFail), лаг: $l, упреждение: $leadMs мс, скорость: ${lastSpeed.toInt()} px/с")
+                  }
+              }
+
+              private fun tickStatus() {
+                  if (!alive) return
+                  if (!running) syncPos()
+                  bubble.invalidate()
+                  ui.postDelayed({ tickStatus() }, 400)
+              }
+
+              override fun onDestroy() {
+                  alive = false; running = false
+                  ui.removeCallbacksAndMessages(null)
+                  if (::hudRoot.isInitialized) save()
+                  closePipette()
+                  if (::moveH.isInitialized) { moveH.hide(); sizeH.hide(); targetH.hide() }
+                  if (::frameV.isInitialized) try { wm.removeView(frameV) } catch (e: Exception) {}
+                  if (::hudRoot.isInitialized) try { wm.removeView(hudRoot) } catch (e: Exception) {}
+                  synchronized(lock) { cur?.close(); cur = null }
+                  vd?.release(); reader?.close(); projection?.stop()
+                  super.onDestroy()
+              }
+          }
+          EOF_TC
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_TC'
+          <resources>
+              <string name="a11y_desc">Нужна только чтобы делать нажатия по экрану в нужный момент.</string>
+          </resources>
+          EOF_TC
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_TC'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:isAccessibilityTool="true"
+              android:description="@string/a11y_desc"/>
+          EOF_TC
+          cat > build.gradle.kts <<'EOF_TC'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_TC
+          cat > gradle.properties <<'EOF_TC'
+          org.gradle.jvmargs=-Xmx2g
+          EOF_TC
+          cat > settings.gradle.kts <<'EOF_TC'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TriggerClicker"
+          include(":app")
+          EOF_TC
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TriggerClicker-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
