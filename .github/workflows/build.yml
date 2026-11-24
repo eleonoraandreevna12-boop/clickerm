@@ -135,6 +135,7 @@ jobs:
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
+                  val sp = getSharedPreferences("kl", MODE_PRIVATE)
                   val pad = (16 * resources.displayMetrics.density).toInt()
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -150,13 +151,13 @@ jobs:
                   fun btn(t: String, f: () -> Unit) =
                       Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
 
-                  text("Кликер: клик по цвету в рамке с адаптацией к задержке игры")
-                  tol = field("Допуск цвета (0-255)", "25")
-                  pre = field("Задержка до клика, мс", "0")
-                  cool = field("Пауза после клика, мс", "150")
-                  adapt = CheckBox(this).apply { text = "Адаптация к задержке (повтор клика)"; isChecked = true }
+                  text("Кликер: клик по цвету в круге с адаптацией к задержке игры")
+                  tol = field("Допуск цвета (0-255)", sp.getInt("tol", 25).toString())
+                  pre = field("Задержка до клика, мс", sp.getLong("pre", 0L).toString())
+                  cool = field("Пауза после клика, мс", sp.getLong("cool", 150L).toString())
+                  adapt = CheckBox(this).apply { text = "Адаптация к задержке (повтор клика)"; isChecked = sp.getBoolean("adapt", true) }
                   root.addView(adapt)
-                  disappear = CheckBox(this).apply { text = "Режим: кликать, когда цвет ИСЧЕЗ" }
+                  disappear = CheckBox(this).apply { text = "Режим: кликать, когда цвет ИСЧЕЗ"; isChecked = sp.getBoolean("disappear", false) }
                   root.addView(disappear)
 
                   btn("1. Разрешить поверх других окон") {
@@ -167,8 +168,12 @@ jobs:
                   }
                   btn("3. Запустить") { launch() }
 
-                  text("\nВ игре: двигай зелёный круг за зелёную точку, размер — за белую точку, " +
-                       "оранжевая точка — место нажатия. «Цвет» берёт цвет из центра круга.")
+                  text("\nПосле запуска появится кружок, он остаётся поверх всех приложений, открывать Кликер снова не нужно.\n\n" +
+                       "• Тап по кружку — старт / стоп.\n" +
+                       "• Удержание — меню: 💧 пипетка (коснись любого места экрана, цвет сохранится), " +
+                       "🎯 прицел (круг и точка нажатия), 🔍 размер кружка, ✕ выход.\n" +
+                       "• Сохранённые цвета — точки вокруг кружка. Тап — выбрать, удержание — удалить.\n" +
+                       "• В центре кружка виден выбранный цвет. Красная точка — не включены Спецвозможности.")
                   setContentView(ScrollView(this).apply { addView(root) })
 
                   if (Build.VERSION.SDK_INT >= 33)
@@ -186,11 +191,16 @@ jobs:
               override fun onActivityResult(req: Int, res: Int, data: Intent?) {
                   super.onActivityResult(req, res, data)
                   if (req == 42 && res == RESULT_OK && data != null) {
+                      val t = tol.text.toString().toIntOrNull() ?: 25
+                      val p = pre.text.toString().toLongOrNull() ?: 0L
+                      val c = cool.text.toString().toLongOrNull() ?: 150L
+                      getSharedPreferences("kl", MODE_PRIVATE).edit()
+                          .putInt("tol", t).putLong("pre", p).putLong("cool", c)
+                          .putBoolean("adapt", adapt.isChecked).putBoolean("disappear", disappear.isChecked)
+                          .apply()
                       val i = Intent(this, OverlayService::class.java)
                           .putExtra("code", res).putExtra("data", data)
-                          .putExtra("tol", tol.text.toString().toIntOrNull() ?: 25)
-                          .putExtra("pre", pre.text.toString().toLongOrNull() ?: 0L)
-                          .putExtra("cool", cool.text.toString().toLongOrNull() ?: 150L)
+                          .putExtra("tol", t).putExtra("pre", p).putExtra("cool", c)
                           .putExtra("adapt", adapt.isChecked)
                           .putExtra("disappear", disappear.isChecked)
                       startForegroundService(i)
@@ -205,12 +215,17 @@ jobs:
           cat > app/src/main/java/com/example/triggerclicker/OverlayService.kt <<'EOF_TC'
           package com.example.triggerclicker
 
+          import android.animation.ValueAnimator
           import android.app.*
           import android.content.Intent
           import android.content.pm.ServiceInfo
           import android.content.res.Configuration
+          import android.graphics.Canvas
           import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
           import android.graphics.PixelFormat
+          import android.graphics.RectF
           import android.graphics.drawable.GradientDrawable
           import android.hardware.display.DisplayManager
           import android.hardware.display.VirtualDisplay
@@ -220,18 +235,27 @@ jobs:
           import android.media.projection.MediaProjectionManager
           import android.os.*
           import android.util.DisplayMetrics
+          import android.util.TypedValue
           import android.view.Gravity
+          import android.view.HapticFeedbackConstants
           import android.view.MotionEvent
           import android.view.View
+          import android.view.ViewConfiguration
           import android.view.WindowManager
-          import android.widget.Button
-          import android.widget.LinearLayout
+          import android.view.animation.DecelerateInterpolator
+          import android.view.animation.OvershootInterpolator
+          import android.widget.FrameLayout
           import android.widget.TextView
+          import android.widget.Toast
           import kotlin.math.abs
+          import kotlin.math.cos
           import kotlin.math.max
           import kotlin.math.min
+          import kotlin.math.sin
 
           class OverlayService : Service() {
+              private class Act(val label: String, val bg: Int, val deg: Int, val onClick: () -> Unit)
+
               private val ui = Handler(Looper.getMainLooper())
               private lateinit var wm: WindowManager
               private var projection: MediaProjection? = null
@@ -243,10 +267,11 @@ jobs:
               private var H = 0
               private var dpi = 0
 
-              // рамка, точка клика, панель (координаты окон, px)
+              // круг-детектор, точка нажатия, кружок-меню (px)
               private var fx = 300; private var fy = 300; private var fw = 160; private var fh = 160
               private var tx = 700; private var ty = 500
-              private var px0 = 20; private var py0 = 120
+              private var hudX = Int.MIN_VALUE; private var hudY = 0
+              private var bubbleStep = 1
               @Volatile private var offX = 0
               @Volatile private var offY = 0
               @Volatile private var color = Color.RED
@@ -260,19 +285,27 @@ jobs:
               private var tol = 25; private var pre = 0L; private var cool = 150L
               private var adapt = true; private var wantPresent = true
 
-              private var ps = 1.0f
-              private var S = 96
-              private val btns = ArrayList<TextView>()
+              private val palette = ArrayList<Int>()
+              private var aiming = true
+              private var expanded = false
+              private val menuViews = ArrayList<View>()
+              private var pipette: PipetteView? = null
+              private val menuClose = Runnable { collapse() }
+
               private lateinit var frameV: View
               private lateinit var frameP: WindowManager.LayoutParams
               private lateinit var moveH: Handle
               private lateinit var sizeH: Handle
               private lateinit var targetH: Handle
-              private lateinit var status: TextView
-              private lateinit var btnRun: Button
-              private lateinit var btnColor: Button
-              private lateinit var panel: View
-              private lateinit var panelP: WindowManager.LayoutParams
+              private lateinit var hudRoot: FrameLayout
+              private lateinit var hudP: WindowManager.LayoutParams
+              private lateinit var bubble: BubbleView
+
+              private fun bubbleSize(): Int =
+                  (resources.displayMetrics.density * intArrayOf(44, 56, 72)[bubbleStep.coerceIn(0, 2)]).toInt()
+
+              private val S: Int
+                  get() = (bubbleSize() * 0.6f).toInt()
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -284,6 +317,7 @@ jobs:
                   adapt = i.getBooleanExtra("adapt", true)
                   wantPresent = !i.getBooleanExtra("disappear", false)
                   startFg()
+                  load()
 
                   val code = i.getIntExtra("code", 0)
                   @Suppress("DEPRECATION")
@@ -299,9 +333,12 @@ jobs:
                   }
                   wm = getSystemService(WINDOW_SERVICE) as WindowManager
                   setupCapture()
+                  if (hudX == Int.MIN_VALUE) { hudX = W - bubbleSize(); hudY = H / 3 }
+                  clampAll()
                   buildOverlay()
                   Thread { loop() }.apply { isDaemon = true; start() }
                   tickStatus()
+                  toast("Тап по кружку — старт/стоп. Удержание — меню.")
                   return START_NOT_STICKY
               }
 
@@ -314,6 +351,48 @@ jobs:
                   if (Build.VERSION.SDK_INT >= 29)
                       startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
                   else startForeground(1, n)
+              }
+
+              private fun toast(s: String) {
+                  ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+              }
+
+              // ---------- сохранение настроек и палитры ----------
+              private fun prefs() = getSharedPreferences("kl", MODE_PRIVATE)
+
+              private fun load() {
+                  val p = prefs()
+                  aiming = !p.contains("fx")
+                  fx = p.getInt("fx", fx); fy = p.getInt("fy", fy); fw = p.getInt("fw", fw); fh = fw
+                  tx = p.getInt("tx", tx); ty = p.getInt("ty", ty)
+                  hudX = p.getInt("hx", Int.MIN_VALUE); hudY = p.getInt("hy", 0)
+                  bubbleStep = p.getInt("bs", 1)
+                  color = p.getInt("color", Color.RED)
+                  palette.clear()
+                  for (s in (p.getString("pal", "") ?: "").split(",")) {
+                      val v = s.toIntOrNull()
+                      if (v != null) palette.add(v)
+                  }
+              }
+
+              private fun save() {
+                  prefs().edit()
+                      .putInt("fx", fx).putInt("fy", fy).putInt("fw", fw)
+                      .putInt("tx", tx).putInt("ty", ty)
+                      .putInt("hx", hudX).putInt("hy", hudY)
+                      .putInt("bs", bubbleStep).putInt("color", color)
+                      .putString("pal", palette.joinToString(","))
+                      .apply()
+              }
+
+              private fun near(a: Int, b: Int): Boolean =
+                  abs(Color.red(a) - Color.red(b)) < 12 && abs(Color.green(a) - Color.green(b)) < 12 &&
+                      abs(Color.blue(a) - Color.blue(b)) < 12
+
+              private fun addPalette(c: Int) {
+                  palette.removeAll { near(it, c) }
+                  palette.add(0, c)
+                  while (palette.size > 8) palette.removeAt(palette.size - 1)
               }
 
               // ---------- захват экрана ----------
@@ -337,26 +416,29 @@ jobs:
                   old?.close()
 
                   // при повороте экрана переносим всё в видимую область
-                  if (oldW > 0 && (oldW != W || oldH != H) && ::panelP.isInitialized) {
+                  if (oldW > 0 && (oldW != W || oldH != H) && ::hudRoot.isInitialized) {
+                      collapse(false)
                       fx = fx * W / oldW; fy = fy * H / oldH
                       tx = tx * W / oldW; ty = ty * H / oldH
-                      px0 = px0 * W / oldW; py0 = py0 * H / oldH
+                      hudX = hudX * W / oldW; hudY = hudY * H / oldH
                       clampAll()
+                      hudX = if (hudX + bubbleSize() / 2 < W / 2) 0 else W - bubbleSize()
                       relayoutAll()
                   }
               }
 
               private fun clampAll() {
+                  val b = bubbleSize()
                   fw = fw.coerceIn(60, max(60, W - 2 * S))
                   fh = fh.coerceIn(60, max(60, H - 2 * S))
                   fx = fx.coerceIn(S, max(S, W - fw - S))
                   fy = fy.coerceIn(S, max(S, H - fh - S))
                   tx = tx.coerceIn(S / 2, max(S / 2, W - S / 2))
                   ty = ty.coerceIn(S / 2, max(S / 2, H - S / 2))
-                  px0 = px0.coerceIn(0, max(0, W - 250))
-                  py0 = py0.coerceIn(0, max(0, H - 150))
                   val sq = min(fw, fh)
                   fw = sq; fh = sq
+                  hudX = hudX.coerceIn(0, max(0, W - b))
+                  hudY = hudY.coerceIn(0, max(0, H - b))
               }
 
               override fun onConfigurationChanged(c: Configuration) {
@@ -378,6 +460,8 @@ jobs:
                   if (o + 2 >= b.limit()) return 0
                   return Color.rgb(b.get(o).toInt() and 255, b.get(o + 1).toInt() and 255, b.get(o + 2).toInt() and 255)
               }
+
+              private fun sample(x: Int, y: Int): Int = synchronized(lock) { refresh(); px(x, y) }
 
               private fun match(): Boolean = synchronized(lock) {
                   refresh()
@@ -402,18 +486,6 @@ jobs:
                           abs(Color.blue(p) - Color.blue(c)) <= tol) return true
                   }
                   false
-              }
-
-              private fun pickColor() = synchronized(lock) {
-                  refresh()
-                  if (cur != null) {
-                      color = px(fx + offX + fw / 2, fy + offY + fh / 2)
-                      val lum = Color.red(color) * 0.3 + Color.green(color) * 0.6 + Color.blue(color) * 0.1
-                      ui.post {
-                          btnColor.setBackgroundColor(color)
-                          btnColor.setTextColor(if (lum > 140) Color.BLACK else Color.WHITE)
-                      }
-                  }
               }
 
               // ---------- движок ----------
@@ -445,7 +517,7 @@ jobs:
                       val timeout = if (lat > 0) (lat * 1.6 + 20).coerceIn(40.0, 500.0) else 150.0
                       var ok = false
                       while ((System.nanoTime() - t0) / 1e6 < timeout) {
-                          if (match() != want) { ok = true; break }   // игра отреагировала
+                          if (match() != want) { ok = true; break }
                           Thread.sleep(1)
                       }
                       if (ok) {
@@ -455,12 +527,12 @@ jobs:
                       }
                       if (++retries >= 3) break
                   }
-                  while (running && match() == want) Thread.sleep(2)   // не кликать по кругу
+                  while (running && match() == want) Thread.sleep(2)
                   Thread.sleep(cool)
               }
 
-              // ---------- оверлей ----------
-              // alpha 0.7: Android 12+ блокирует нажатия сквозь окна непрозрачнее 0.8
+              // ---------- окна ----------
+              // alpha < 0.8: Android 12+ блокирует нажатия сквозь окна непрозрачнее 0.8
               private fun lp(w: Int, h: Int, touch: Boolean, x: Int, y: Int): WindowManager.LayoutParams {
                   val q = WindowManager.LayoutParams(
                       w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -477,6 +549,7 @@ jobs:
                   return q
               }
 
+              // точки для прицеливания (двигать круг, менять размер, место нажатия)
               private inner class Handle(col: Int, var x: Int, var y: Int, val onMove: (Int, Int) -> Unit) {
                   val v = View(this@OverlayService).apply {
                       background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col); setStroke(5, Color.WHITE) }
@@ -484,7 +557,6 @@ jobs:
                   val p = lp(S, S, true, x, y)
                   var attached = false
                   init {
-                      show()
                       var sx = 0f; var sy = 0f; var ox = 0; var oy = 0
                       v.setOnTouchListener { _, e ->
                           when (e.action) {
@@ -492,6 +564,7 @@ jobs:
                               MotionEvent.ACTION_MOVE -> {
                                   moveTo(ox + (e.rawX - sx).toInt(), oy + (e.rawY - sy).toInt()); onMove(x, y)
                               }
+                              MotionEvent.ACTION_UP -> save()
                           }
                           true
                       }
@@ -499,7 +572,7 @@ jobs:
                   fun show() { if (!attached) { try { wm.addView(v, p); attached = true } catch (e: Exception) {} } }
                   fun hide() { if (attached) { try { wm.removeView(v) } catch (e: Exception) {}; attached = false } }
                   fun moveTo(nx: Int, ny: Int) { x = nx; y = ny; p.x = nx; p.y = ny; if (attached) wm.updateViewLayout(v, p) }
-                  fun resize(s: Int) { p.width = s; p.height = s }
+                  fun resize() { p.width = S; p.height = S }
               }
 
               private fun relayout() {
@@ -514,32 +587,319 @@ jobs:
               private fun relayoutAll() {
                   relayout()
                   targetH.moveTo(tx - S / 2, ty - S / 2)
-                  panelP.x = px0; panelP.y = py0
-                  wm.updateViewLayout(panel, panelP)
+                  if (!expanded) {
+                      hudP.x = hudX; hudP.y = hudY
+                      hudP.width = bubbleSize(); hudP.height = bubbleSize()
+                      wm.updateViewLayout(hudRoot, hudP)
+                  }
               }
 
-              private fun mk(t: String, f: () -> Unit): Button {
-                  val b = Button(this)
-                  b.text = t
-                  b.isAllCaps = false
-                  b.minWidth = 0; b.minimumWidth = 0; b.minHeight = 0; b.minimumHeight = 0
-                  b.setOnClickListener { f() }
-                  btns.add(b)
-                  return b
+              private fun applyAim() {
+                  if (aiming && !running) {
+                      moveH.show(); sizeH.show(); targetH.show()
+                      relayoutAll()
+                  } else {
+                      moveH.hide(); sizeH.hide(); targetH.hide()
+                  }
               }
 
-              private fun applyScale() {
-                  val d = resources.displayMetrics.density
-                  val pad = (8 * ps * d).toInt()
-                  for (b in btns) { b.textSize = 14f * ps; b.setPadding(pad, pad / 2, pad, pad / 2) }
-                  status.textSize = 12f * ps
-                  S = (96 * ps).toInt()
-                  moveH.resize(S); sizeH.resize(S); targetH.resize(S)
+              private fun aimAction() {
+                  if (running) toggle()
+                  aiming = !aiming
+                  applyAim()
+                  collapse()
+              }
+
+              private fun cycleSize() {
+                  collapse(false)
+                  bubbleStep = (bubbleStep + 1) % 3
+                  val b = bubbleSize()
+                  val q = bubble.layoutParams as FrameLayout.LayoutParams
+                  q.width = b; q.height = b
+                  bubble.layoutParams = q
+                  moveH.resize(); sizeH.resize(); targetH.resize()
                   clampAll()
-                  relayout()
                   relayoutAll()
+                  save()
               }
 
+              // ---------- кружок ----------
+              private inner class BubbleView : View(this@OverlayService) {
+                  private val pr = Paint(Paint.ANTI_ALIAS_FLAG)
+                  private var phase = 0f
+                  private val anim = ValueAnimator.ofFloat(0f, 1f).apply {
+                      duration = 1000
+                      repeatCount = ValueAnimator.INFINITE
+                      addUpdateListener { phase = it.animatedValue as Float; invalidate() }
+                  }
+
+                  fun sync() {
+                      if (running) { if (!anim.isRunning) anim.start() } else { anim.cancel(); phase = 0f; invalidate() }
+                  }
+
+                  override fun onDetachedFromWindow() { anim.cancel(); super.onDetachedFromWindow() }
+
+                  override fun onDraw(c: Canvas) {
+                      val w = width.toFloat()
+                      val m = w / 2f
+                      val base = m * 0.80f
+                      val green = Color.parseColor("#00E676")
+                      if (running) {
+                          pr.style = Paint.Style.STROKE; pr.strokeWidth = m * 0.10f; pr.color = green
+                          pr.alpha = (200 * (1f - phase)).toInt()
+                          c.drawCircle(m, m, base + (m - base) * phase, pr)
+                      }
+                      pr.style = Paint.Style.FILL; pr.color = Color.parseColor("#F2151A21")
+                      c.drawCircle(m, m, base, pr)
+                      pr.style = Paint.Style.STROKE; pr.strokeWidth = m * 0.10f
+                      pr.color = if (running) green else Color.WHITE
+                      c.drawCircle(m, m, base, pr)
+                      val col = color
+                      pr.style = Paint.Style.FILL; pr.color = col
+                      c.drawCircle(m, m, base * 0.58f, pr)
+                      val lum = Color.red(col) * 0.3 + Color.green(col) * 0.6 + Color.blue(col) * 0.1
+                      pr.color = if (lum > 140) Color.BLACK else Color.WHITE
+                      if (running) {
+                          val s = base * 0.22f
+                          c.drawRoundRect(RectF(m - s, m - s, m + s, m + s), s * 0.25f, s * 0.25f, pr)
+                      } else {
+                          val s = base * 0.26f
+                          val path = Path()
+                          path.moveTo(m - s * 0.7f, m - s)
+                          path.lineTo(m + s, m)
+                          path.lineTo(m - s * 0.7f, m + s)
+                          path.close()
+                          c.drawPath(path, pr)
+                      }
+                      if (ClickerAccessibility.inst == null) {
+                          pr.style = Paint.Style.FILL; pr.color = Color.parseColor("#E53935")
+                          c.drawCircle(w * 0.84f, w * 0.16f, m * 0.24f, pr)
+                          pr.style = Paint.Style.STROKE; pr.strokeWidth = m * 0.05f; pr.color = Color.WHITE
+                          c.drawCircle(w * 0.84f, w * 0.16f, m * 0.24f, pr)
+                      }
+                  }
+              }
+
+              private fun attachBubbleTouch(v: View) {
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+                  var downX = 0f; var downY = 0f; var sx = 0; var sy = 0
+                  var moved = false
+                  var longDone = false
+                  val longRun = Runnable {
+                      longDone = true
+                      v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                      if (expanded) collapse() else expand()
+                  }
+                  v.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX; downY = e.rawY; sx = hudX; sy = hudY
+                              moved = false; longDone = false
+                              ui.postDelayed(longRun, 380)
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - downX
+                              val dy = e.rawY - downY
+                              if (!moved && (abs(dx) > slop || abs(dy) > slop)) { moved = true; ui.removeCallbacks(longRun) }
+                              if (moved && !expanded) {
+                                  hudX = sx + dx.toInt(); hudY = sy + dy.toInt()
+                                  hudP.x = hudX; hudP.y = hudY
+                                  wm.updateViewLayout(hudRoot, hudP)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              ui.removeCallbacks(longRun)
+                              if (moved && !expanded) snap()
+                              else if (!moved && !longDone) { if (expanded) collapse() else toggle() }
+                          }
+                          MotionEvent.ACTION_CANCEL -> ui.removeCallbacks(longRun)
+                      }
+                      true
+                  }
+              }
+
+              // прилипание кружка к краю экрана
+              private fun snap() {
+                  val b = bubbleSize()
+                  val targetX = if (hudX + b / 2 < W / 2) 0 else W - b
+                  val targetY = hudY.coerceIn(0, max(0, H - b))
+                  val fromX = hudX
+                  val fromY = hudY
+                  ValueAnimator.ofFloat(0f, 1f).apply {
+                      duration = 220
+                      interpolator = DecelerateInterpolator()
+                      addUpdateListener {
+                          val t = it.animatedValue as Float
+                          hudX = (fromX + (targetX - fromX) * t).toInt()
+                          hudY = (fromY + (targetY - fromY) * t).toInt()
+                          if (!expanded) {
+                              hudP.x = hudX; hudP.y = hudY
+                              try { wm.updateViewLayout(hudRoot, hudP) } catch (e: Exception) {}
+                          }
+                      }
+                      start()
+                  }
+                  save()
+              }
+
+              private fun roundBtn(label: String, bg: Int, size: Int): TextView {
+                  val t = TextView(this)
+                  t.text = label
+                  t.gravity = Gravity.CENTER
+                  t.setTextColor(Color.WHITE)
+                  t.setTextSize(TypedValue.COMPLEX_UNIT_PX, size * 0.46f)
+                  t.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(bg); setStroke(3, Color.WHITE) }
+                  t.layoutParams = FrameLayout.LayoutParams(size, size, Gravity.CENTER)
+                  return t
+              }
+
+              private fun addMenu(v: View, mx: Float, my: Float, i: Int, onClick: () -> Unit, onLong: (() -> Unit)?) {
+                  v.scaleX = 0f; v.scaleY = 0f; v.alpha = 0f
+                  v.setOnClickListener {
+                      v.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                      onClick()
+                  }
+                  if (onLong != null) v.setOnLongClickListener { onLong(); true }
+                  hudRoot.addView(v)
+                  menuViews.add(v)
+                  v.animate().translationX(mx).translationY(my).scaleX(1f).scaleY(1f).alpha(1f)
+                      .setStartDelay(i * 22L).setDuration(240).setInterpolator(OvershootInterpolator(1.4f)).start()
+              }
+
+              private fun expand() {
+                  if (expanded) return
+                  expanded = true
+                  val b = bubbleSize()
+                  val m = (b * 4.9f).toInt()
+                  val cx = (hudX + b / 2).coerceIn(m / 2, max(m / 2, W - m / 2))
+                  val cy = (hudY + b / 2).coerceIn(m / 2, max(m / 2, H - m / 2))
+                  hudP.width = m; hudP.height = m
+                  hudP.x = cx - m / 2; hudP.y = cy - m / 2
+                  wm.updateViewLayout(hudRoot, hudP)
+
+                  val a = (b * 0.78f).toInt()
+                  val d = (b * 0.6f).toInt()
+                  val r1 = b * 1.35f
+                  val r2 = b * 2.05f
+                  val acts = listOf(
+                      Act("💧", Color.parseColor("#1E88E5"), -135) { startPipette() },
+                      Act("🎯", Color.parseColor("#43A047"), -45) { aimAction() },
+                      Act("🔍", Color.parseColor("#8E24AA"), 135) { cycleSize() },
+                      Act("✕", Color.parseColor("#E53935"), 45) { stopSelf() }
+                  )
+                  var i = 0
+                  for (act in acts) {
+                      val v = roundBtn(act.label, act.bg, a)
+                      val rad = Math.toRadians(act.deg.toDouble())
+                      addMenu(v, (r1 * cos(rad)).toFloat(), (r1 * sin(rad)).toFloat(), i++, { act.onClick() }, null)
+                  }
+                  for ((k, c) in palette.withIndex()) {
+                      val v = roundBtn("", c, d)
+                      (v.background as GradientDrawable).setStroke(if (c == color) 8 else 3, Color.WHITE)
+                      val rad = Math.toRadians(-90.0 + k * 45.0)
+                      addMenu(v, (r2 * cos(rad)).toFloat(), (r2 * sin(rad)).toFloat(), i++,
+                          { color = c; save(); bubble.invalidate(); collapse() },
+                          { palette.removeAll { it == c }; save(); collapse(false); expand() })
+                  }
+                  bubble.bringToFront()
+                  ui.removeCallbacks(menuClose)
+                  ui.postDelayed(menuClose, 7000)
+              }
+
+              private fun collapse(animated: Boolean = true) {
+                  if (!expanded) return
+                  expanded = false
+                  ui.removeCallbacks(menuClose)
+                  val finish = Runnable {
+                      if (!expanded) {
+                          for (v in menuViews) hudRoot.removeView(v)
+                          menuViews.clear()
+                          hudP.width = bubbleSize(); hudP.height = bubbleSize()
+                          hudP.x = hudX; hudP.y = hudY
+                          try { wm.updateViewLayout(hudRoot, hudP) } catch (e: Exception) {}
+                      }
+                  }
+                  if (!animated || menuViews.isEmpty()) { finish.run(); return }
+                  for (v in menuViews)
+                      v.animate().translationX(0f).translationY(0f).scaleX(0f).scaleY(0f).alpha(0f)
+                          .setStartDelay(0).setDuration(140).start()
+                  ui.postDelayed(finish, 160)
+              }
+
+              // ---------- пипетка: коснись любого места экрана ----------
+              private inner class PipetteView : View(this@OverlayService) {
+                  private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  private var fxp = -1f
+                  private var fyp = -1f
+                  private var cc = 0
+
+                  override fun onDraw(c: Canvas) {
+                      val d = resources.displayMetrics.density
+                      val w = width.toFloat()
+                      p.style = Paint.Style.FILL; p.color = Color.parseColor("#CC000000")
+                      c.drawRoundRect(RectF(w / 2f - 150 * d, 40 * d, w / 2f + 150 * d, 84 * d), 22 * d, 22 * d, p)
+                      p.color = Color.WHITE; p.textSize = 14 * d; p.textAlign = Paint.Align.CENTER
+                      c.drawText("Коснись нужного цвета и отпусти", w / 2f, 68 * d, p)
+                      p.color = Color.parseColor("#CCE53935")
+                      c.drawCircle(w - 40 * d, 62 * d, 24 * d, p)
+                      p.color = Color.WHITE; p.textSize = 20 * d
+                      c.drawText("✕", w - 40 * d, 69 * d, p)
+                      if (fxp >= 0f) {
+                          val sy = max(60f * d, fyp - 90 * d)
+                          p.style = Paint.Style.FILL; p.color = cc
+                          c.drawCircle(fxp, sy, 34 * d, p)
+                          p.style = Paint.Style.STROKE; p.strokeWidth = 4 * d; p.color = Color.WHITE
+                          c.drawCircle(fxp, sy, 34 * d, p)
+                          p.strokeWidth = 2 * d
+                          c.drawCircle(fxp, fyp, 14 * d, p)
+                      }
+                  }
+
+                  override fun onTouchEvent(e: MotionEvent): Boolean {
+                      val d = resources.displayMetrics.density
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                              fxp = e.x; fyp = e.y
+                              cc = sample(e.rawX.toInt(), e.rawY.toInt())
+                              invalidate()
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              val cancel = e.x > width - 80 * d && e.y < 110 * d
+                              val got = sample(e.rawX.toInt(), e.rawY.toInt())
+                              ui.post { endPipette(if (cancel) null else got) }
+                          }
+                      }
+                      return true
+                  }
+              }
+
+              private fun startPipette() {
+                  if (pipette != null) return
+                  collapse(false)
+                  val v = PipetteView()
+                  pipette = v
+                  val q = lp(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, true, 0, 0)
+                  q.alpha = 0.78f
+                  try { wm.addView(v, q) } catch (e: Exception) { pipette = null; return }
+                  ui.postDelayed({ if (pipette === v) endPipette(null) }, 15000)
+              }
+
+              private fun endPipette(c: Int?) {
+                  val v = pipette ?: return
+                  pipette = null
+                  try { wm.removeView(v) } catch (e: Exception) {}
+                  if (c != null && c != 0) {
+                      color = c
+                      addPalette(c)
+                      save()
+                      bubble.invalidate()
+                      toast("Цвет сохранён и выбран")
+                  } else if (c != null) {
+                      toast("Не удалось взять цвет, попробуй ещё раз")
+                  }
+              }
+
+              // ---------- сборка интерфейса ----------
               private fun buildOverlay() {
                   frameV = View(this).apply {
                       background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(4, Color.parseColor("#00FF66")) }
@@ -559,41 +919,20 @@ jobs:
                   }
                   targetH = Handle(Color.parseColor("#FF9900"), tx - S / 2, ty - S / 2) { x, y -> tx = x + S / 2; ty = y + S / 2 }
 
-                  status = TextView(this).apply { setTextColor(Color.WHITE) }
-                  val grip = TextView(this).apply { text = "☰"; setTextColor(Color.WHITE); gravity = Gravity.CENTER }
-                  btns.add(grip)
-                  btnRun = mk("▶") { toggle() }
-                  btnColor = mk("Цвет") { pickColor() }
-                  btnColor.setBackgroundColor(color)
-                  btnColor.setTextColor(Color.WHITE)
-                  val btnMinus = mk("−") { ps = max(0.6f, ps - 0.2f); applyScale() }
-                  val btnPlus = mk("+") { ps = min(2.5f, ps + 0.2f); applyScale() }
-                  val btnExit = mk("✕") { stopSelf() }
-
-                  val row = LinearLayout(this)
-                  for (w in listOf<View>(grip, btnRun, btnColor, btnMinus, btnPlus, btnExit)) row.addView(w)
-                  panel = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(Color.parseColor("#CC000000"))
-                      addView(status); addView(row)
+                  bubble = BubbleView()
+                  hudRoot = FrameLayout(this)
+                  hudRoot.addView(bubble, FrameLayout.LayoutParams(bubbleSize(), bubbleSize(), Gravity.CENTER))
+                  attachBubbleTouch(bubble)
+                  hudRoot.setOnTouchListener { _, e ->
+                      if (e.action == MotionEvent.ACTION_OUTSIDE) collapse()
+                      false
                   }
-                  panelP = lp(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, true, px0, py0)
-                  wm.addView(panel, panelP)
-
-                  // перетаскивание панели за значок ☰
-                  var gx = 0f; var gy = 0f; var ox = 0; var oy = 0
-                  grip.setOnTouchListener { _, e ->
-                      when (e.action) {
-                          MotionEvent.ACTION_DOWN -> { gx = e.rawX; gy = e.rawY; ox = px0; oy = py0 }
-                          MotionEvent.ACTION_MOVE -> {
-                              px0 = ox + (e.rawX - gx).toInt(); py0 = oy + (e.rawY - gy).toInt()
-                              panelP.x = px0; panelP.y = py0
-                              wm.updateViewLayout(panel, panelP)
-                          }
-                      }
-                      true
-                  }
-                  applyScale()
+                  hudP = lp(bubbleSize(), bubbleSize(), true, hudX, hudY)
+                  hudP.flags = hudP.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                      WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+                  hudP.alpha = 0.78f
+                  wm.addView(hudRoot, hudP)
+                  applyAim()
               }
 
               // разница между координатами окна и экрана (вырез камеры и т.п.)
@@ -608,32 +947,32 @@ jobs:
               private fun toggle() {
                   syncPos()
                   running = !running
-                  btnRun.text = if (running) "■" else "▶"
+                  bubble.sync()
+                  bubble.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                   if (running) {
-                      // при работе убираем кружки, чтобы они не перекрывали место нажатия
-                      moveH.hide(); sizeH.hide(); targetH.hide()
+                      aiming = false
+                      applyAim()
                   } else {
-                      moveH.show(); sizeH.show(); targetH.show()
-                      relayoutAll()
+                      val l = if (lat > 0) lat.toInt().toString() + " мс" else "—"
+                      toast("Стоп. Нажатий: $clicks (ок $tapOk, отказ $tapFail), лаг: $l")
                   }
               }
 
               private fun tickStatus() {
                   if (!alive) return
                   if (!running) syncPos()
-                  val l = if (lat > 0) "${lat.toInt()} мс" else "—"
-                  val st = if (running) "РАБОТАЕТ" else "стоп"
-                  val warn = if (ClickerAccessibility.inst == null) " | ВКЛЮЧИ СПЕЦВОЗМОЖНОСТИ" else ""
-                  status.text = "$st | нажатий $clicks (ок $tapOk, отказ $tapFail) | лаг $l$warn"
-                  ui.postDelayed({ tickStatus() }, 200)
+                  bubble.invalidate()
+                  ui.postDelayed({ tickStatus() }, 400)
               }
 
               override fun onDestroy() {
                   alive = false; running = false
                   ui.removeCallbacksAndMessages(null)
+                  if (::hudRoot.isInitialized) save()
+                  pipette?.let { try { wm.removeView(it) } catch (e: Exception) {} }
                   if (::moveH.isInitialized) { moveH.hide(); sizeH.hide(); targetH.hide() }
                   if (::frameV.isInitialized) try { wm.removeView(frameV) } catch (e: Exception) {}
-                  if (::panel.isInitialized) try { wm.removeView(panel) } catch (e: Exception) {}
+                  if (::hudRoot.isInitialized) try { wm.removeView(hudRoot) } catch (e: Exception) {}
                   synchronized(lock) { cur?.close(); cur = null }
                   vd?.release(); reader?.close(); projection?.stop()
                   super.onDestroy()
