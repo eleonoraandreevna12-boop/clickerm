@@ -1,0 +1,523 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Create project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_TC'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.triggerclicker"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.triggerclicker"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_TC
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_TC'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+              <application android:label="Trigger Clicker" android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service android:name=".OverlayService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection"/>
+
+                  <service android:name=".ClickerAccessibility" android:exported="true"
+                      android:label="Trigger Clicker"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF_TC
+          mkdir -p app/src/main/java/com/example/triggerclicker
+          cat > app/src/main/java/com/example/triggerclicker/ClickerAccessibility.kt <<'EOF_TC'
+          package com.example.triggerclicker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          class ClickerAccessibility : AccessibilityService() {
+              companion object {
+                  @Volatile var inst: ClickerAccessibility? = null
+              }
+
+              override fun onServiceConnected() { inst = this }
+              override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun tap(x: Float, y: Float) {
+                  val path = Path().apply { moveTo(x, y) }
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 15))
+                      .build()
+                  dispatchGesture(g, null, null)
+              }
+          }
+          EOF_TC
+          mkdir -p app/src/main/java/com/example/triggerclicker
+          cat > app/src/main/java/com/example/triggerclicker/MainActivity.kt <<'EOF_TC'
+          package com.example.triggerclicker
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var tol: EditText
+              private lateinit var pre: EditText
+              private lateinit var cool: EditText
+              private lateinit var adapt: CheckBox
+              private lateinit var disappear: CheckBox
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  fun text(t: String) = TextView(this).apply { text = t }.also { root.addView(it) }
+                  fun field(label: String, def: String): EditText {
+                      text(label)
+                      return EditText(this).apply {
+                          setText(def); inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                      }.also { root.addView(it) }
+                  }
+                  fun btn(t: String, f: () -> Unit) =
+                      Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
+
+                  text("Trigger Clicker: клик по цвету в рамке с адаптацией к задержке игры")
+                  tol = field("Допуск цвета (0-255)", "25")
+                  pre = field("Задержка до клика, мс", "0")
+                  cool = field("Пауза после клика, мс", "150")
+                  adapt = CheckBox(this).apply { text = "Адаптация к задержке (повтор клика)"; isChecked = true }
+                  root.addView(adapt)
+                  disappear = CheckBox(this).apply { text = "Режим: кликать, когда цвет ИСЧЕЗ" }
+                  root.addView(disappear)
+
+                  btn("1. Разрешить поверх других окон") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  btn("2. Включить «Спецвозможности» (Trigger Clicker)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  btn("3. Запустить") { launch() }
+
+                  text("\nВ игре: двигай зелёную рамку за зелёный кружок, размер — за белый справа-снизу, " +
+                       "оранжевый кружок — точка клика. «Цвет» берёт цвет из центра рамки.")
+                  setContentView(ScrollView(this).apply { addView(root) })
+
+                  if (Build.VERSION.SDK_INT >= 33)
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+              }
+
+              private fun launch() {
+                  if (!Settings.canDrawOverlays(this)) { toast("Сначала шаг 1"); return }
+                  if (ClickerAccessibility.inst == null) { toast("Сначала шаг 2"); return }
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 42)
+              }
+
+              @Deprecated("simple")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 42 && res == RESULT_OK && data != null) {
+                      val i = Intent(this, OverlayService::class.java)
+                          .putExtra("code", res).putExtra("data", data)
+                          .putExtra("tol", tol.text.toString().toIntOrNull() ?: 25)
+                          .putExtra("pre", pre.text.toString().toLongOrNull() ?: 0L)
+                          .putExtra("cool", cool.text.toString().toLongOrNull() ?: 150L)
+                          .putExtra("adapt", adapt.isChecked)
+                          .putExtra("disappear", disappear.isChecked)
+                      startForegroundService(i)
+                      moveTaskToBack(true)
+                  }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          EOF_TC
+          mkdir -p app/src/main/java/com/example/triggerclicker
+          cat > app/src/main/java/com/example/triggerclicker/OverlayService.kt <<'EOF_TC'
+          package com.example.triggerclicker
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.abs
+          import kotlin.math.max
+
+          class OverlayService : Service() {
+              private val ui = Handler(Looper.getMainLooper())
+              private lateinit var wm: WindowManager
+              private var projection: MediaProjection? = null
+              private var reader: ImageReader? = null
+              private var vd: VirtualDisplay? = null
+              private var cur: Image? = null
+              private val lock = Any()
+              private var W = 0
+              private var H = 0
+              private var dpi = 0
+
+              // рамка и точка клика (координаты экрана, px)
+              private var fx = 300; private var fy = 700; private var fw = 140; private var fh = 140
+              private var tx = 540; private var ty = 1400
+              @Volatile private var color = Color.RED
+              @Volatile private var running = false
+              @Volatile private var alive = true
+              @Volatile private var lat = -1.0   // сглаженная задержка реакции игры, мс
+              @Volatile private var clicks = 0
+
+              private var tol = 25; private var pre = 0L; private var cool = 150L
+              private var adapt = true; private var wantPresent = true
+
+              private val S = 96
+              private lateinit var frameV: View
+              private lateinit var frameP: WindowManager.LayoutParams
+              private lateinit var moveH: Handle
+              private lateinit var sizeH: Handle
+              private lateinit var targetH: Handle
+              private lateinit var status: TextView
+              private lateinit var btnRun: Button
+              private lateinit var btnColor: Button
+              private lateinit var panel: View
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, flags: Int, id: Int): Int {
+                  if (i == null || projection != null) return START_NOT_STICKY
+                  tol = i.getIntExtra("tol", 25)
+                  pre = i.getLongExtra("pre", 0)
+                  cool = i.getLongExtra("cool", 150)
+                  adapt = i.getBooleanExtra("adapt", true)
+                  wantPresent = !i.getBooleanExtra("disappear", false)
+                  startFg()
+
+                  val code = i.getIntExtra("code", 0)
+                  @Suppress("DEPRECATION")
+                  val data: Intent = (if (Build.VERSION.SDK_INT >= 33)
+                      i.getParcelableExtra("data", Intent::class.java) else i.getParcelableExtra("data")) ?: run {
+                      stopSelf(); return START_NOT_STICKY
+                  }
+                  val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(code, data).also {
+                      it.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() { ui.post { stopSelf() } }
+                      }, ui)
+                  }
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  setupCapture()
+                  buildOverlay()
+                  Thread { loop() }.apply { isDaemon = true; start() }
+                  tickStatus()
+                  return START_NOT_STICKY
+              }
+
+              private fun startFg() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("tc", "Trigger Clicker", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "tc")
+                      .setContentTitle("Trigger Clicker работает")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass).build()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  else startForeground(1, n)
+              }
+
+              // ---------- захват экрана ----------
+              @Suppress("DEPRECATION")
+              private fun setupCapture() {
+                  val dm = DisplayMetrics()
+                  (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+                  W = dm.widthPixels; H = dm.heightPixels; dpi = dm.densityDpi
+                  synchronized(lock) { cur?.close(); cur = null }
+                  val old = reader
+                  reader = ImageReader.newInstance(W, H, PixelFormat.RGBA_8888, 3)
+                  if (vd == null) {
+                      vd = projection!!.createVirtualDisplay("tc", W, H, dpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, null)
+                  } else {
+                      vd!!.resize(W, H, dpi)
+                      vd!!.surface = reader!!.surface
+                  }
+                  old?.close()
+              }
+
+              override fun onConfigurationChanged(c: Configuration) {
+                  super.onConfigurationChanged(c)
+                  if (projection != null) ui.postDelayed({ setupCapture() }, 300)
+              }
+
+              private fun refresh() {
+                  val n = try { reader?.acquireLatestImage() } catch (e: Exception) { null }
+                  if (n != null) { cur?.close(); cur = n }
+              }
+
+              private fun px(x: Int, y: Int): Int {
+                  val im = cur ?: return 0
+                  if (x < 0 || y < 0 || x >= im.width || y >= im.height) return 0
+                  val p = im.planes[0]
+                  val o = y * p.rowStride + x * p.pixelStride
+                  val b = p.buffer
+                  if (o + 2 >= b.limit()) return 0
+                  return Color.rgb(b.get(o).toInt() and 255, b.get(o + 1).toInt() and 255, b.get(o + 2).toInt() and 255)
+              }
+
+              private fun match(): Boolean = synchronized(lock) {
+                  refresh()
+                  if (cur == null) return false
+                  val inset = 6
+                  val nx = (fw - 2 * inset).coerceIn(8, 40) / 5
+                  val ny = (fh - 2 * inset).coerceIn(8, 40) / 5
+                  val c = color
+                  for (i in 0..max(1, nx)) for (j in 0..max(1, ny)) {
+                      val x = fx + inset + (fw - 2 * inset - 1) * i / max(1, nx)
+                      val y = fy + inset + (fh - 2 * inset - 1) * j / max(1, ny)
+                      val p = px(x, y)
+                      if (abs(Color.red(p) - Color.red(c)) <= tol && abs(Color.green(p) - Color.green(c)) <= tol &&
+                          abs(Color.blue(p) - Color.blue(c)) <= tol) return true
+                  }
+                  false
+              }
+
+              private fun pickColor() = synchronized(lock) {
+                  refresh()
+                  if (cur != null) {
+                      color = px(fx + fw / 2, fy + fh / 2)
+                      ui.post { btnColor.setBackgroundColor(color) }
+                  }
+              }
+
+              // ---------- движок ----------
+              private fun click() {
+                  ClickerAccessibility.inst?.tap(tx.toFloat(), ty.toFloat())
+                  clicks++
+              }
+
+              private fun loop() {
+                  while (alive) {
+                      if (!running) { Thread.sleep(20); continue }
+                      try { tick() } catch (e: Exception) { Thread.sleep(50) }
+                      Thread.sleep(1)
+                  }
+              }
+
+              private fun tick() {
+                  val want = wantPresent
+                  if (match() != want) return
+                  if (pre > 0) Thread.sleep(pre)
+                  var retries = 0
+                  while (running) {
+                      val t0 = System.nanoTime()
+                      click()
+                      if (!adapt) break
+                      val timeout = if (lat > 0) (lat * 1.6 + 20).coerceIn(40.0, 500.0) else 150.0
+                      var ok = false
+                      while ((System.nanoTime() - t0) / 1e6 < timeout) {
+                          if (match() != want) { ok = true; break }   // игра отреагировала
+                          Thread.sleep(1)
+                      }
+                      if (ok) {
+                          val d = (System.nanoTime() - t0) / 1e6
+                          lat = if (lat < 0) d else lat * 0.8 + d * 0.2
+                          break
+                      }
+                      if (++retries >= 3) break
+                  }
+                  while (running && match() == want) Thread.sleep(2)   // не кликать по кругу
+                  Thread.sleep(cool)
+              }
+
+              // ---------- оверлей ----------
+              private fun lp(w: Int, h: Int, touch: Boolean, x: Int, y: Int) = WindowManager.LayoutParams(
+                  w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      (if (touch) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+                  PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START; this.x = x; this.y = y }
+
+              private inner class Handle(col: Int, var x: Int, var y: Int, val onMove: (Int, Int) -> Unit) {
+                  val v = View(this@OverlayService).apply {
+                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col); setStroke(5, Color.WHITE); alpha = 200 }
+                  }
+                  val p = lp(S, S, true, x, y)
+                  init {
+                      wm.addView(v, p)
+                      var sx = 0f; var sy = 0f; var ox = 0; var oy = 0
+                      v.setOnTouchListener { _, e ->
+                          when (e.action) {
+                              MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = x; oy = y }
+                              MotionEvent.ACTION_MOVE -> {
+                                  moveTo(ox + (e.rawX - sx).toInt(), oy + (e.rawY - sy).toInt()); onMove(x, y)
+                              }
+                          }
+                          true
+                      }
+                  }
+                  fun moveTo(nx: Int, ny: Int) { x = nx; y = ny; p.x = nx; p.y = ny; wm.updateViewLayout(v, p) }
+              }
+
+              private fun relayout() {
+                  frameP.x = fx; frameP.y = fy; frameP.width = fw; frameP.height = fh
+                  wm.updateViewLayout(frameV, frameP)
+                  moveH.moveTo(fx - S, fy - S)
+                  sizeH.moveTo(fx + fw, fy + fh)
+              }
+
+              private fun buildOverlay() {
+                  frameV = View(this).apply {
+                      background = GradientDrawable().apply { setColor(Color.TRANSPARENT); setStroke(4, Color.parseColor("#00FF66")) }
+                  }
+                  frameP = lp(fw, fh, false, fx, fy)
+                  wm.addView(frameV, frameP)
+
+                  moveH = Handle(Color.parseColor("#00CC55"), fx - S, fy - S) { x, y -> fx = x + S; fy = y + S; relayout() }
+                  sizeH = Handle(Color.WHITE, fx + fw, fy + fh) { x, y -> fw = max(60, x - fx); fh = max(60, y - fy); relayout() }
+                  targetH = Handle(Color.parseColor("#FF9900"), tx - S / 2, ty - S / 2) { x, y -> tx = x + S / 2; ty = y + S / 2 }
+
+                  status = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f }
+                  btnRun = Button(this).apply { text = "▶"; setOnClickListener { toggle() } }
+                  btnColor = Button(this).apply { text = "Цвет"; setBackgroundColor(color); setOnClickListener { pickColor() } }
+                  val btnExit = Button(this).apply { text = "✕"; setOnClickListener { stopSelf() } }
+                  val row = LinearLayout(this).apply { addView(btnRun); addView(btnColor); addView(btnExit) }
+                  panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#AA000000"))
+                      addView(status); addView(row)
+                  }
+                  wm.addView(panel, lp(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, true, 20, 120))
+              }
+
+              private fun toggle() {
+                  running = !running
+                  btnRun.text = if (running) "■" else "▶"
+              }
+
+              private fun tickStatus() {
+                  if (!alive) return
+                  val l = if (lat > 0) "${lat.toInt()} мс" else "—"
+                  status.text = "${if (running) "РАБОТАЕТ" else "стоп"} | кликов $clicks | лаг игры $l" +
+                      if (ClickerAccessibility.inst == null) " | ВКЛЮЧИ СПЕЦВОЗМОЖНОСТИ" else ""
+                  ui.postDelayed({ tickStatus() }, 200)
+              }
+
+              override fun onDestroy() {
+                  alive = false; running = false
+                  ui.removeCallbacksAndMessages(null)
+                  for (v in listOf(frameV, panel, moveH.v, sizeH.v, targetH.v)) try { wm.removeView(v) } catch (e: Exception) {}
+                  synchronized(lock) { cur?.close(); cur = null }
+                  vd?.release(); reader?.close(); projection?.stop()
+                  super.onDestroy()
+              }
+          }
+          EOF_TC
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_TC'
+          <resources>
+              <string name="a11y_desc">Нужна только чтобы делать нажатия по экрану в нужный момент.</string>
+          </resources>
+          EOF_TC
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_TC'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/a11y_desc"/>
+          EOF_TC
+          cat > build.gradle.kts <<'EOF_TC'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_TC
+          cat > gradle.properties <<'EOF_TC'
+          org.gradle.jvmargs=-Xmx2g
+          EOF_TC
+          cat > settings.gradle.kts <<'EOF_TC'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TriggerClicker"
+          include(":app")
+          EOF_TC
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TriggerClicker-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
