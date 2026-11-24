@@ -10,7 +10,6 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      # - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
@@ -49,7 +48,7 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
-              <application android:label="Trigger Clicker" android:theme="@android:style/Theme.Material.Light">
+              <application android:label="Кликер" android:theme="@android:style/Theme.Material.Light">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
@@ -61,7 +60,7 @@ jobs:
                       android:foregroundServiceType="mediaProjection"/>
 
                   <service android:name=".ClickerAccessibility" android:exported="true"
-                      android:label="Trigger Clicker"
+                      android:label="Кликер"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
                       <intent-filter>
                           <action android:name="android.accessibilityservice.AccessibilityService"/>
@@ -80,6 +79,8 @@ jobs:
           import android.accessibilityservice.GestureDescription
           import android.content.Intent
           import android.graphics.Path
+          import android.os.Handler
+          import android.os.Looper
           import android.view.accessibility.AccessibilityEvent
 
           class ClickerAccessibility : AccessibilityService() {
@@ -87,17 +88,26 @@ jobs:
                   @Volatile var inst: ClickerAccessibility? = null
               }
 
+              private val h = Handler(Looper.getMainLooper())
+
               override fun onServiceConnected() { inst = this }
               override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
               override fun onInterrupt() {}
 
-              fun tap(x: Float, y: Float) {
-                  val path = Path().apply { moveTo(x, y) }
-                  val g = GestureDescription.Builder()
-                      .addStroke(GestureDescription.StrokeDescription(path, 0, 15))
-                      .build()
-                  dispatchGesture(g, null, null)
+              fun tap(x: Float, y: Float, onResult: (Boolean) -> Unit) {
+                  h.post {
+                      val path = Path().apply { moveTo(x, y) }
+                      val g = GestureDescription.Builder()
+                          .addStroke(GestureDescription.StrokeDescription(path, 0, 40))
+                          .build()
+                      val cb = object : AccessibilityService.GestureResultCallback() {
+                          override fun onCompleted(gestureDescription: GestureDescription?) { onResult(true) }
+                          override fun onCancelled(gestureDescription: GestureDescription?) { onResult(false) }
+                      }
+                      val ok = dispatchGesture(g, cb, null)
+                      if (!ok) onResult(false)
+                  }
               }
           }
           EOF_TC
@@ -140,7 +150,7 @@ jobs:
                   fun btn(t: String, f: () -> Unit) =
                       Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
 
-                  text("Trigger Clicker: клик по цвету в рамке с адаптацией к задержке игры")
+                  text("Кликер: клик по цвету в рамке с адаптацией к задержке игры")
                   tol = field("Допуск цвета (0-255)", "25")
                   pre = field("Задержка до клика, мс", "0")
                   cool = field("Пауза после клика, мс", "150")
@@ -152,13 +162,13 @@ jobs:
                   btn("1. Разрешить поверх других окон") {
                       startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                   }
-                  btn("2. Включить «Спецвозможности» (Trigger Clicker)") {
+                  btn("2. Включить «Спецвозможности» (Кликер)") {
                       startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                   }
                   btn("3. Запустить") { launch() }
 
-                  text("\nВ игре: двигай зелёную рамку за зелёный кружок, размер — за белый справа-снизу, " +
-                       "оранжевый кружок — точка клика. «Цвет» берёт цвет из центра рамки.")
+                  text("\nВ игре: двигай зелёный круг за зелёную точку, размер — за белую точку, " +
+                       "оранжевая точка — место нажатия. «Цвет» берёт цвет из центра круга.")
                   setContentView(ScrollView(this).apply { addView(root) })
 
                   if (Build.VERSION.SDK_INT >= 33)
@@ -219,6 +229,7 @@ jobs:
           import android.widget.TextView
           import kotlin.math.abs
           import kotlin.math.max
+          import kotlin.math.min
 
           class OverlayService : Service() {
               private val ui = Handler(Looper.getMainLooper())
@@ -232,19 +243,26 @@ jobs:
               private var H = 0
               private var dpi = 0
 
-              // рамка и точка клика (координаты экрана, px)
-              private var fx = 300; private var fy = 700; private var fw = 140; private var fh = 140
-              private var tx = 540; private var ty = 1400
+              // рамка, точка клика, панель (координаты окон, px)
+              private var fx = 300; private var fy = 300; private var fw = 160; private var fh = 160
+              private var tx = 700; private var ty = 500
+              private var px0 = 20; private var py0 = 120
+              @Volatile private var offX = 0
+              @Volatile private var offY = 0
               @Volatile private var color = Color.RED
               @Volatile private var running = false
               @Volatile private var alive = true
-              @Volatile private var lat = -1.0   // сглаженная задержка реакции игры, мс
+              @Volatile private var lat = -1.0
               @Volatile private var clicks = 0
+              @Volatile private var tapOk = 0
+              @Volatile private var tapFail = 0
 
               private var tol = 25; private var pre = 0L; private var cool = 150L
               private var adapt = true; private var wantPresent = true
 
-              private val S = 96
+              private var ps = 1.0f
+              private var S = 96
+              private val btns = ArrayList<TextView>()
               private lateinit var frameV: View
               private lateinit var frameP: WindowManager.LayoutParams
               private lateinit var moveH: Handle
@@ -254,6 +272,7 @@ jobs:
               private lateinit var btnRun: Button
               private lateinit var btnColor: Button
               private lateinit var panel: View
+              private lateinit var panelP: WindowManager.LayoutParams
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -288,9 +307,9 @@ jobs:
 
               private fun startFg() {
                   val nm = getSystemService(NotificationManager::class.java)
-                  nm.createNotificationChannel(NotificationChannel("tc", "Trigger Clicker", NotificationManager.IMPORTANCE_LOW))
+                  nm.createNotificationChannel(NotificationChannel("tc", "Кликер", NotificationManager.IMPORTANCE_LOW))
                   val n = Notification.Builder(this, "tc")
-                      .setContentTitle("Trigger Clicker работает")
+                      .setContentTitle("Кликер работает")
                       .setSmallIcon(android.R.drawable.ic_menu_compass).build()
                   if (Build.VERSION.SDK_INT >= 29)
                       startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
@@ -302,6 +321,8 @@ jobs:
               private fun setupCapture() {
                   val dm = DisplayMetrics()
                   (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+                  val oldW = W
+                  val oldH = H
                   W = dm.widthPixels; H = dm.heightPixels; dpi = dm.densityDpi
                   synchronized(lock) { cur?.close(); cur = null }
                   val old = reader
@@ -314,6 +335,28 @@ jobs:
                       vd!!.surface = reader!!.surface
                   }
                   old?.close()
+
+                  // при повороте экрана переносим всё в видимую область
+                  if (oldW > 0 && (oldW != W || oldH != H) && ::panelP.isInitialized) {
+                      fx = fx * W / oldW; fy = fy * H / oldH
+                      tx = tx * W / oldW; ty = ty * H / oldH
+                      px0 = px0 * W / oldW; py0 = py0 * H / oldH
+                      clampAll()
+                      relayoutAll()
+                  }
+              }
+
+              private fun clampAll() {
+                  fw = fw.coerceIn(60, max(60, W - 2 * S))
+                  fh = fh.coerceIn(60, max(60, H - 2 * S))
+                  fx = fx.coerceIn(S, max(S, W - fw - S))
+                  fy = fy.coerceIn(S, max(S, H - fh - S))
+                  tx = tx.coerceIn(S / 2, max(S / 2, W - S / 2))
+                  ty = ty.coerceIn(S / 2, max(S / 2, H - S / 2))
+                  px0 = px0.coerceIn(0, max(0, W - 250))
+                  py0 = py0.coerceIn(0, max(0, H - 150))
+                  val sq = min(fw, fh)
+                  fw = sq; fh = sq
               }
 
               override fun onConfigurationChanged(c: Configuration) {
@@ -339,13 +382,21 @@ jobs:
               private fun match(): Boolean = synchronized(lock) {
                   refresh()
                   if (cur == null) return false
+                  val bx = fx + offX
+                  val by = fy + offY
                   val inset = 6
                   val nx = (fw - 2 * inset).coerceIn(8, 40) / 5
                   val ny = (fh - 2 * inset).coerceIn(8, 40) / 5
                   val c = color
+                  val ccx = bx + fw / 2.0
+                  val ccy = by + fh / 2.0
+                  val rr = (fw - 2 * inset) / 2.0
                   for (i in 0..max(1, nx)) for (j in 0..max(1, ny)) {
-                      val x = fx + inset + (fw - 2 * inset - 1) * i / max(1, nx)
-                      val y = fy + inset + (fh - 2 * inset - 1) * j / max(1, ny)
+                      val x = bx + inset + (fw - 2 * inset - 1) * i / max(1, nx)
+                      val y = by + inset + (fh - 2 * inset - 1) * j / max(1, ny)
+                      val ddx = x - ccx
+                      val ddy = y - ccy
+                      if (ddx * ddx + ddy * ddy > rr * rr) continue
                       val p = px(x, y)
                       if (abs(Color.red(p) - Color.red(c)) <= tol && abs(Color.green(p) - Color.green(c)) <= tol &&
                           abs(Color.blue(p) - Color.blue(c)) <= tol) return true
@@ -356,15 +407,22 @@ jobs:
               private fun pickColor() = synchronized(lock) {
                   refresh()
                   if (cur != null) {
-                      color = px(fx + fw / 2, fy + fh / 2)
-                      ui.post { btnColor.setBackgroundColor(color) }
+                      color = px(fx + offX + fw / 2, fy + offY + fh / 2)
+                      val lum = Color.red(color) * 0.3 + Color.green(color) * 0.6 + Color.blue(color) * 0.1
+                      ui.post {
+                          btnColor.setBackgroundColor(color)
+                          btnColor.setTextColor(if (lum > 140) Color.BLACK else Color.WHITE)
+                      }
                   }
               }
 
               // ---------- движок ----------
               private fun click() {
-                  ClickerAccessibility.inst?.tap(tx.toFloat(), ty.toFloat())
+                  val s = ClickerAccessibility.inst ?: return
                   clicks++
+                  s.tap((tx + offX).toFloat(), (ty + offY).toFloat()) { ok ->
+                      if (ok) { tapOk++ } else { tapFail++ }
+                  }
               }
 
               private fun loop() {
@@ -402,21 +460,31 @@ jobs:
               }
 
               // ---------- оверлей ----------
-              private fun lp(w: Int, h: Int, touch: Boolean, x: Int, y: Int) = WindowManager.LayoutParams(
-                  w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                      (if (touch) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
-                  PixelFormat.TRANSLUCENT
-              ).apply { gravity = Gravity.TOP or Gravity.START; this.x = x; this.y = y }
+              // alpha 0.7: Android 12+ блокирует нажатия сквозь окна непрозрачнее 0.8
+              private fun lp(w: Int, h: Int, touch: Boolean, x: Int, y: Int): WindowManager.LayoutParams {
+                  val q = WindowManager.LayoutParams(
+                      w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          (if (touch) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+                      PixelFormat.TRANSLUCENT)
+                  q.gravity = Gravity.TOP or Gravity.START
+                  q.x = x
+                  q.y = y
+                  q.alpha = 0.7f
+                  if (Build.VERSION.SDK_INT >= 28)
+                      q.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  return q
+              }
 
               private inner class Handle(col: Int, var x: Int, var y: Int, val onMove: (Int, Int) -> Unit) {
                   val v = View(this@OverlayService).apply {
-                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col); setStroke(5, Color.WHITE); alpha = 200 }
+                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col); setStroke(5, Color.WHITE) }
                   }
                   val p = lp(S, S, true, x, y)
+                  var attached = false
                   init {
-                      wm.addView(v, p)
+                      show()
                       var sx = 0f; var sy = 0f; var ox = 0; var oy = 0
                       v.setOnTouchListener { _, e ->
                           when (e.action) {
@@ -428,57 +496,144 @@ jobs:
                           true
                       }
                   }
-                  fun moveTo(nx: Int, ny: Int) { x = nx; y = ny; p.x = nx; p.y = ny; wm.updateViewLayout(v, p) }
+                  fun show() { if (!attached) { try { wm.addView(v, p); attached = true } catch (e: Exception) {} } }
+                  fun hide() { if (attached) { try { wm.removeView(v) } catch (e: Exception) {}; attached = false } }
+                  fun moveTo(nx: Int, ny: Int) { x = nx; y = ny; p.x = nx; p.y = ny; if (attached) wm.updateViewLayout(v, p) }
+                  fun resize(s: Int) { p.width = s; p.height = s }
               }
 
               private fun relayout() {
                   frameP.x = fx; frameP.y = fy; frameP.width = fw; frameP.height = fh
                   wm.updateViewLayout(frameV, frameP)
-                  moveH.moveTo(fx - S, fy - S)
-                  sizeH.moveTo(fx + fw, fy + fh)
+                  val r = fw / 2
+                  val k = (r * 0.707f).toInt()
+                  moveH.moveTo(fx + r - k - S / 2, fy + r - k - S / 2)
+                  sizeH.moveTo(fx + r + k - S / 2, fy + r + k - S / 2)
+              }
+
+              private fun relayoutAll() {
+                  relayout()
+                  targetH.moveTo(tx - S / 2, ty - S / 2)
+                  panelP.x = px0; panelP.y = py0
+                  wm.updateViewLayout(panel, panelP)
+              }
+
+              private fun mk(t: String, f: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = t
+                  b.isAllCaps = false
+                  b.minWidth = 0; b.minimumWidth = 0; b.minHeight = 0; b.minimumHeight = 0
+                  b.setOnClickListener { f() }
+                  btns.add(b)
+                  return b
+              }
+
+              private fun applyScale() {
+                  val d = resources.displayMetrics.density
+                  val pad = (8 * ps * d).toInt()
+                  for (b in btns) { b.textSize = 14f * ps; b.setPadding(pad, pad / 2, pad, pad / 2) }
+                  status.textSize = 12f * ps
+                  S = (96 * ps).toInt()
+                  moveH.resize(S); sizeH.resize(S); targetH.resize(S)
+                  clampAll()
+                  relayout()
+                  relayoutAll()
               }
 
               private fun buildOverlay() {
                   frameV = View(this).apply {
-                      background = GradientDrawable().apply { setColor(Color.TRANSPARENT); setStroke(4, Color.parseColor("#00FF66")) }
+                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(4, Color.parseColor("#00FF66")) }
                   }
                   frameP = lp(fw, fh, false, fx, fy)
                   wm.addView(frameV, frameP)
 
-                  moveH = Handle(Color.parseColor("#00CC55"), fx - S, fy - S) { x, y -> fx = x + S; fy = y + S; relayout() }
-                  sizeH = Handle(Color.WHITE, fx + fw, fy + fh) { x, y -> fw = max(60, x - fx); fh = max(60, y - fy); relayout() }
+                  moveH = Handle(Color.parseColor("#00CC55"), fx, fy) { x, y ->
+                      val r = fw / 2
+                      val k = (r * 0.707f).toInt()
+                      fx = x + S / 2 + k - r; fy = y + S / 2 + k - r; relayout()
+                  }
+                  sizeH = Handle(Color.WHITE, fx, fy) { x, y ->
+                      val r = ((x + S / 2 - fx) + (y + S / 2 - fy)) / 3.4f
+                      val d = max(60, (r * 2).toInt())
+                      fw = d; fh = d; relayout()
+                  }
                   targetH = Handle(Color.parseColor("#FF9900"), tx - S / 2, ty - S / 2) { x, y -> tx = x + S / 2; ty = y + S / 2 }
 
-                  status = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f }
-                  btnRun = Button(this).apply { text = "▶"; setOnClickListener { toggle() } }
-                  btnColor = Button(this).apply { text = "Цвет"; setBackgroundColor(color); setOnClickListener { pickColor() } }
-                  val btnExit = Button(this).apply { text = "✕"; setOnClickListener { stopSelf() } }
-                  val row = LinearLayout(this).apply { addView(btnRun); addView(btnColor); addView(btnExit) }
+                  status = TextView(this).apply { setTextColor(Color.WHITE) }
+                  val grip = TextView(this).apply { text = "☰"; setTextColor(Color.WHITE); gravity = Gravity.CENTER }
+                  btns.add(grip)
+                  btnRun = mk("▶") { toggle() }
+                  btnColor = mk("Цвет") { pickColor() }
+                  btnColor.setBackgroundColor(color)
+                  btnColor.setTextColor(Color.WHITE)
+                  val btnMinus = mk("−") { ps = max(0.6f, ps - 0.2f); applyScale() }
+                  val btnPlus = mk("+") { ps = min(2.5f, ps + 0.2f); applyScale() }
+                  val btnExit = mk("✕") { stopSelf() }
+
+                  val row = LinearLayout(this)
+                  for (w in listOf<View>(grip, btnRun, btnColor, btnMinus, btnPlus, btnExit)) row.addView(w)
                   panel = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(Color.parseColor("#AA000000"))
+                      setBackgroundColor(Color.parseColor("#CC000000"))
                       addView(status); addView(row)
                   }
-                  wm.addView(panel, lp(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, true, 20, 120))
+                  panelP = lp(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, true, px0, py0)
+                  wm.addView(panel, panelP)
+
+                  // перетаскивание панели за значок ☰
+                  var gx = 0f; var gy = 0f; var ox = 0; var oy = 0
+                  grip.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { gx = e.rawX; gy = e.rawY; ox = px0; oy = py0 }
+                          MotionEvent.ACTION_MOVE -> {
+                              px0 = ox + (e.rawX - gx).toInt(); py0 = oy + (e.rawY - gy).toInt()
+                              panelP.x = px0; panelP.y = py0
+                              wm.updateViewLayout(panel, panelP)
+                          }
+                      }
+                      true
+                  }
+                  applyScale()
+              }
+
+              // разница между координатами окна и экрана (вырез камеры и т.п.)
+              private fun syncPos() {
+                  val a = IntArray(2)
+                  frameV.getLocationOnScreen(a)
+                  val dx = a[0] - frameP.x
+                  val dy = a[1] - frameP.y
+                  if (abs(dx) < 300 && abs(dy) < 300) { offX = dx; offY = dy }
               }
 
               private fun toggle() {
+                  syncPos()
                   running = !running
                   btnRun.text = if (running) "■" else "▶"
+                  if (running) {
+                      // при работе убираем кружки, чтобы они не перекрывали место нажатия
+                      moveH.hide(); sizeH.hide(); targetH.hide()
+                  } else {
+                      moveH.show(); sizeH.show(); targetH.show()
+                      relayoutAll()
+                  }
               }
 
               private fun tickStatus() {
                   if (!alive) return
+                  if (!running) syncPos()
                   val l = if (lat > 0) "${lat.toInt()} мс" else "—"
-                  status.text = "${if (running) "РАБОТАЕТ" else "стоп"} | кликов $clicks | лаг игры $l" +
-                      if (ClickerAccessibility.inst == null) " | ВКЛЮЧИ СПЕЦВОЗМОЖНОСТИ" else ""
+                  val st = if (running) "РАБОТАЕТ" else "стоп"
+                  val warn = if (ClickerAccessibility.inst == null) " | ВКЛЮЧИ СПЕЦВОЗМОЖНОСТИ" else ""
+                  status.text = "$st | нажатий $clicks (ок $tapOk, отказ $tapFail) | лаг $l$warn"
                   ui.postDelayed({ tickStatus() }, 200)
               }
 
               override fun onDestroy() {
                   alive = false; running = false
                   ui.removeCallbacksAndMessages(null)
-                  for (v in listOf(frameV, panel, moveH.v, sizeH.v, targetH.v)) try { wm.removeView(v) } catch (e: Exception) {}
+                  if (::moveH.isInitialized) { moveH.hide(); sizeH.hide(); targetH.hide() }
+                  if (::frameV.isInitialized) try { wm.removeView(frameV) } catch (e: Exception) {}
+                  if (::panel.isInitialized) try { wm.removeView(panel) } catch (e: Exception) {}
                   synchronized(lock) { cur?.close(); cur = null }
                   vd?.release(); reader?.close(); projection?.stop()
                   super.onDestroy()
@@ -498,6 +653,7 @@ jobs:
               android:accessibilityEventTypes="typeWindowStateChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:canPerformGestures="true"
+              android:isAccessibilityTool="true"
               android:description="@string/a11y_desc"/>
           EOF_TC
           cat > build.gradle.kts <<'EOF_TC'
