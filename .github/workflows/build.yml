@@ -151,10 +151,10 @@ jobs:
                   fun btn(t: String, f: () -> Unit) =
                       Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
 
-                  text("Кликер: клик по цвету в круге с адаптацией к задержке игры")
+                  text("Кликер: нажатие в момент касания двух цветов (стрелка и зона) или по одному цвету")
                   tol = field("Допуск цвета (0-255)", sp.getInt("tol", 25).toString())
                   pre = field("Задержка до клика, мс", sp.getLong("pre", 0L).toString())
-                  cool = field("Пауза после клика, мс", sp.getLong("cool", 150L).toString())
+                  cool = field("Пауза после нажатия, мс (для стрелки и зоны 400-800)", sp.getLong("cool", 150L).toString())
                   adapt = CheckBox(this).apply { text = "Адаптация к задержке (повтор клика)"; isChecked = sp.getBoolean("adapt", true) }
                   root.addView(adapt)
                   disappear = CheckBox(this).apply { text = "Режим: кликать, когда цвет ИСЧЕЗ"; isChecked = sp.getBoolean("disappear", false) }
@@ -168,12 +168,15 @@ jobs:
                   }
                   btn("3. Запустить") { launch() }
 
-                  text("\nПосле запуска появится кружок, он остаётся поверх всех приложений, открывать Кликер снова не нужно.\n\n" +
+                  text("\nПосле запуска появится кружок, он остаётся поверх всех приложений.\n\n" +
                        "• Тап по кружку — старт / стоп.\n" +
-                       "• Удержание — меню: 💧 пипетка (коснись любого места экрана, цвет сохранится), " +
-                       "🎯 прицел (круг и точка нажатия), 🔍 размер кружка, ✕ выход.\n" +
-                       "• Сохранённые цвета — точки вокруг кружка. Тап — выбрать, удержание — удалить.\n" +
-                       "• В центре кружка виден выбранный цвет. Красная точка — не включены Спецвозможности.")
+                       "• Удержание — меню: 💧 пипетка с лупой (в режиме ⚡ два шага: сначала стрелка, потом зона), " +
+                       "🎯 прицел (круг вокруг дуги: в круг должны попадать и стрелка, и зона), 🔍 размер кружка, ⚡ режим (два цвета / один цвет), " +
+                       "⏪ ⏩ упреждение: ⏪ жмёт раньше, ⏩ позже, ✕ выход.\n" +
+                       "• Внизу кружка при работе две точки: видно ли стрелку и зону.\n" +
+                       "• После старта первые 1–2 взмаха стрелки уходят на поиск оси качания, потом включается прицеливание.\n" +
+                       "• Скорость стрелки считается по шагам, разворот на краю замечается сразу, упреждение подстраивается само по месту остановки стрелки.\n" +
+                       "• Сохранённые цвета — точки вокруг кружка. Тап — выбрать, удержание — удалить.")
                   setContentView(ScrollView(this).apply { addView(root) })
 
                   if (Build.VERSION.SDK_INT >= 33)
@@ -248,10 +251,57 @@ jobs:
           import android.widget.TextView
           import android.widget.Toast
           import kotlin.math.abs
+          import kotlin.math.atan2
           import kotlin.math.cos
+          import kotlin.math.hypot
           import kotlin.math.max
           import kotlin.math.min
           import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          // =====================================================================================
+          //  НАСТРОЙКИ ТОЧНОСТИ (всё, что можно подкрутить, собрано здесь)
+          //  Что измерено по видео: стрелка крутится вокруг неподвижной оси, идёт с ПОСТОЯННОЙ скоростью
+          //  между краями примерно ±58° и мгновенно разворачивается на краю. После каждого попадания
+          //  скорость растёт (≈165 → 200 → 235 → 270 °/с), а зона сужается (≈21° → 16° → 11° → 7°).
+          //  Игра обновляет стрелку реже, чем идут кадры записи экрана: часть кадров одинаковая.
+          // =====================================================================================
+          private object Tune {
+              // --- чувствительность зрения ---
+              const val MIN_COLOR_TOL = 40        // минимальный допуск цвета (0-255). Мало цвета найдено -> больше; ловит фон -> меньше
+              const val TRACK_MIN_PX = 6          // сколько пикселей стрелки нужно, чтобы считать её найденной
+              const val ZONE_MIN_PX = 25          // сколько пикселей зоны нужно, чтобы считать зону найденной
+              const val PIVOT_MIN_PX = 40         // сколько пикселей стрелки нужно, чтобы использовать кадр для поиска оси
+              const val PIVOT_MIN_LINES = 20      // сколько кадров собрать, прежде чем считать ось найденной
+              const val PIVOT_MIN_SPREAD_DEG = 40f // на какой угол стрелка должна качнуться, чтобы ось нашлась честно
+              // Ось качания стрелки можно задать руками (в пикселях экрана). -1 = искать автоматически.
+              const val FIXED_PIVOT_X = -1f
+              const val FIXED_PIVOT_Y = -1f
+
+              // --- слежение за траекторией ---
+              const val DUP_DEG = 1.2f            // изменение угла меньше этого = «тот же кадр». Больше -> меньше шума, но грубее
+              const val TURN_RESTART_JUMP_DEG = 25f // прыжок угла больше этого = стрелка начала заново (новый раунд)
+              const val BOUND_START_DEG = 60f     // начальное значение края качания, дальше уточняется само
+              const val BOUND_LEARN_MIN_DEG = 35f // разворот считается «краем» только за этим углом
+              const val REGRESS_MIN_TICKS = 4     // сколько шагов стрелки нужно для оценки скорости
+              const val SWEEP_MIN_TICKS = 2       // сколько шагов после разворота нужно, чтобы уже целиться
+              const val OMEGA_EMA = 0.35          // как быстро скорость подстраивается (0.1 плавно ... 0.6 резко)
+              const val OMEGA_STEP_UP = 1.15f     // после попадания скорость растёт примерно на столько (стартовая догадка)
+              const val OMEGA_MIN_DEG_S = 30f
+              const val OMEGA_MAX_DEG_S = 1500f
+
+              // --- время нажатия ---
+              const val COMMIT_MS = 45            // за сколько мс до нажатия «фиксируем» момент и ждём точно. Не меньше шага кадров игры
+              const val LATE_TOL_FRAC = 0.5       // можно опоздать не больше этой доли от полуширины зоны (в мс), иначе ждём следующий проход
+              const val LEAD_STEP_MS = 5          // шаг кнопок ⏪ ⏩
+              const val LEAD_MAX_MS = 300
+
+              // --- самонастройка упреждения по месту остановки стрелки ---
+              const val CAL_GAIN = 0.3            // 0 = выключить самонастройку, 0.5 = быстро, но шумно
+              const val CAL_MAX_ERR_MS = 120.0    // ошибки больше этой считаем случайностью
+              const val CAL_STILL_MS = 120        // стрелка не двигалась столько мс = остановилась
+              const val MISS_AFTER_MS = 350       // стрелка всё ещё бежит через столько мс после нажатия = промах
+          }
 
           class OverlayService : Service() {
               private class Act(val label: String, val bg: Int, val deg: Int, val onClick: () -> Unit)
@@ -275,15 +325,77 @@ jobs:
               @Volatile private var offX = 0
               @Volatile private var offY = 0
               @Volatile private var color = Color.RED
+              @Volatile private var color2 = Color.YELLOW
+              @Volatile private var contactMode = true
+              @Volatile private var leadMs = 80
+              @Volatile private var seenN = false
+              @Volatile private var seenZ = false
+              private var pipStep = 1
               @Volatile private var running = false
               @Volatile private var alive = true
               @Volatile private var lat = -1.0
               @Volatile private var clicks = 0
               @Volatile private var tapOk = 0
               @Volatile private var tapFail = 0
+              @Volatile private var hits = 0
+              @Volatile private var misses = 0
 
               private var tol = 25; private var pre = 0L; private var cool = 150L
               private var adapt = true; private var wantPresent = true
+
+              // режим «контакт двух цветов»: стрелка + зона
+              private val nxs = IntArray(4000)
+              private val nys = IntArray(4000)
+              private val zxs = IntArray(8000)
+              private val zys = IntArray(8000)
+              private var rowBuf = ByteArray(4096)
+              private var aTs = 0L
+              private var aZn = 0
+              private var aNn = 0
+              private var aZx = 0f
+              private var aZy = 0f
+              private var prevZx = -1f
+              private var prevZy = -1f
+              private var waitChange = false
+              private var lastZx = 0f
+              private var lastZy = 0f
+              private var calibPending = false
+              private var lastSpeed = 0f
+              private var fireNs = 0L
+              private var blockUntilNs = 0L
+
+              // ---- ось качания стрелки: ищется сама как точка пересечения всех линий стрелки ----
+              private var havePivot = false
+              private var pivX = 0f
+              private var pivY = 0f
+              private var pSxx = 0.0; private var pSxy = 0.0; private var pSyy = 0.0
+              private var pBx = 0.0; private var pBy = 0.0
+              private var pN = 0
+              private var pMinA = 999f; private var pMaxA = -999f
+
+              // ---- угол стрелки и зоны относительно оси (0° = вверх, + = вправо) ----
+              private var aHaveTh = false
+              private var aTh = 0f          // угол стрелки в этом кадре
+              private var aPhi = 0f         // угол центра зоны
+              private var aHalf = 3f        // половина ширины зоны, градусы
+
+              // ---- траектория: шаги стрелки с последнего разворота ----
+              private var lastTh = Float.NaN
+              private var swDir = 0         // +1 вправо, -1 влево, 0 пока неизвестно
+              private val tkT = LongArray(8)
+              private val tkA = FloatArray(8)
+              private var tkN = 0
+              private var lastTickNs = 0L
+              private var omega = 0f        // скорость стрелки, °/с (сглаженная)
+              private var omegaN = 0
+              private var omegaPrior = 0f   // догадка о скорости на новом уровне
+              private var bAng = Tune.BOUND_START_DEG
+              private var turns = 0
+
+              // ---- что было в момент последнего нажатия (для самонастройки) ----
+              private var fireDir = 0
+              private var fireOmega = 0f
+              private var firePhi = 0f
 
               private val palette = ArrayList<Int>()
               private var aiming = true
@@ -336,7 +448,10 @@ jobs:
                   if (hudX == Int.MIN_VALUE) { hudX = W - bubbleSize(); hudY = H / 3 }
                   clampAll()
                   buildOverlay()
-                  Thread { loop() }.apply { isDaemon = true; start() }
+                  Thread {
+                      android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+                      loop()
+                  }.apply { isDaemon = true; start() }
                   tickStatus()
                   toast("Тап по кружку — старт/стоп. Удержание — меню.")
                   return START_NOT_STICKY
@@ -353,8 +468,19 @@ jobs:
                   else startForeground(1, n)
               }
 
+              private var curToast: Toast? = null
+
               private fun toast(s: String) {
-                  ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+                  ui.post {
+                      curToast?.cancel()
+                      curToast = Toast.makeText(this, s, Toast.LENGTH_SHORT)
+                      curToast?.show()
+                  }
+              }
+
+              private fun keepMenu() {
+                  ui.removeCallbacks(menuClose)
+                  ui.postDelayed(menuClose, 7000)
               }
 
               // ---------- сохранение настроек и палитры ----------
@@ -368,6 +494,9 @@ jobs:
                   hudX = p.getInt("hx", Int.MIN_VALUE); hudY = p.getInt("hy", 0)
                   bubbleStep = p.getInt("bs", 1)
                   color = p.getInt("color", Color.RED)
+                  color2 = p.getInt("c2", Color.YELLOW)
+                  contactMode = p.getBoolean("cm", true)
+                  leadMs = p.getInt("lead", 80)
                   palette.clear()
                   for (s in (p.getString("pal", "") ?: "").split(",")) {
                       val v = s.toIntOrNull()
@@ -381,6 +510,7 @@ jobs:
                       .putInt("tx", tx).putInt("ty", ty)
                       .putInt("hx", hudX).putInt("hy", hudY)
                       .putInt("bs", bubbleStep).putInt("color", color)
+                      .putInt("c2", color2).putBoolean("cm", contactMode).putInt("lead", leadMs)
                       .putString("pal", palette.joinToString(","))
                       .apply()
               }
@@ -424,6 +554,7 @@ jobs:
                       clampAll()
                       hudX = if (hudX + bubbleSize() / 2 < W / 2) 0 else W - bubbleSize()
                       relayoutAll()
+                      resetTracking() // ось стрелки после поворота экрана другая
                   }
               }
 
@@ -461,7 +592,36 @@ jobs:
                   return Color.rgb(b.get(o).toInt() and 255, b.get(o + 1).toInt() and 255, b.get(o + 2).toInt() and 255)
               }
 
-              private fun sample(x: Int, y: Int): Int = synchronized(lock) { refresh(); px(x, y) }
+              private fun vivid(c: Int): Float {
+                  val r = Color.red(c)
+                  val g = Color.green(c)
+                  val b = Color.blue(c)
+                  val mx = max(r, max(g, b))
+                  val mn = min(r, min(g, b))
+                  if (mx == 0) return 0f
+                  return (mx - mn) / mx.toFloat() * (mx / 255f)
+              }
+
+              // берёт самый яркий и насыщенный пиксель рядом: так можно попасть в тонкую линию
+              private fun smartPick(x: Int, y: Int): Int = synchronized(lock) {
+                  refresh()
+                  val center = px(x, y)
+                  if (center == 0) return 0
+                  var best = center
+                  var bestV = vivid(center)
+                  for (dy in -2..2) for (dx in -2..2) {
+                      val p = px(x + dx, y + dy)
+                      if (p == 0) continue
+                      val v = vivid(p)
+                      if (v > bestV) { bestV = v; best = p }
+                  }
+                  if (vivid(center) >= bestV * 0.85f) center else best
+              }
+
+              private fun grid(x: Int, y: Int, n: Int): IntArray = synchronized(lock) {
+                  refresh()
+                  IntArray(n * n) { i -> px(x + i % n - n / 2, y + i / n - n / 2) }
+              }
 
               private fun match(): Boolean = synchronized(lock) {
                   refresh()
@@ -500,8 +660,9 @@ jobs:
               private fun loop() {
                   while (alive) {
                       if (!running) { Thread.sleep(20); continue }
-                      try { tick() } catch (e: Exception) { Thread.sleep(50) }
-                      Thread.sleep(1)
+                      try {
+                          if (contactMode) tickContact() else { tick(); Thread.sleep(1) }
+                      } catch (e: Exception) { Thread.sleep(50) }
                   }
               }
 
@@ -529,6 +690,356 @@ jobs:
                   }
                   while (running && match() == want) Thread.sleep(2)
                   Thread.sleep(cool)
+              }
+
+
+              // ---------- контакт двух цветов: стрелка + зона ----------
+
+              // [ЗРЕНИЕ] Один кадр: находим пиксели стрелки и зоны, из них считаем углы вокруг оси качания.
+              private fun analyzeFrame(): Int = synchronized(lock) {
+                  val n = try { reader?.acquireLatestImage() } catch (e: Exception) { null }
+                  if (n == null) return 0
+                  cur?.close(); cur = n
+                  val pl = n.planes[0]
+                  val buf = pl.buffer
+                  val rs = pl.rowStride
+                  val ps = pl.pixelStride
+                  val bx = fx + offX
+                  val by = fy + offY
+                  val x0 = max(0, bx)
+                  val y0 = max(0, by)
+                  val x1 = min(n.width, bx + fw)
+                  val y1 = min(n.height, by + fh)
+                  aTs = n.timestamp
+                  aNn = 0; aZn = 0; aHaveTh = false
+                  if (x1 - x0 < 8 || y1 - y0 < 8) return 1
+                  val need = (x1 - x0) * ps
+                  if (rowBuf.size < need) rowBuf = ByteArray(need)
+
+                  val t = max(tol, Tune.MIN_COLOR_TOL)
+                  val ar = Color.red(color); val ag = Color.green(color); val ab = Color.blue(color)
+                  val c2 = color2
+                  val br = Color.red(c2); val bg = Color.green(c2); val bb = Color.blue(c2)
+                  val cxm = bx + fw / 2f
+                  val cym = by + fh / 2f
+                  val rad = fw / 2f - 2f
+                  val rad2 = rad * rad
+                  var nn = 0
+                  var nz = 0
+                  for (y in y0 until y1) {
+                      val dy = y - cym
+                      val hw2 = rad2 - dy * dy
+                      if (hw2 < 0f) continue
+                      val hw = sqrt(hw2)
+                      val xa = max(x0, (cxm - hw).toInt())
+                      val xb = min(x1 - 1, (cxm + hw).toInt())
+                      if (xb <= xa) continue
+                      val off = y * rs + xa * ps
+                      val len = (xb - xa + 1) * ps
+                      if (off + len > buf.limit()) break
+                      buf.position(off)
+                      buf.get(rowBuf, 0, len)
+                      var o = 0
+                      var x = xa
+                      while (x <= xb) {
+                          val r = rowBuf[o].toInt() and 255
+                          val g = rowBuf[o + 1].toInt() and 255
+                          val b = rowBuf[o + 2].toInt() and 255
+                          if (abs(r - ar) <= t && abs(g - ag) <= t && abs(b - ab) <= t) {
+                              if (nn < nxs.size) { nxs[nn] = x; nys[nn] = y; nn++ }
+                          } else if (abs(r - br) <= t && abs(g - bg) <= t && abs(b - bb) <= t) {
+                              if (nz < zxs.size) { zxs[nz] = x; zys[nz] = y; nz++ }
+                          }
+                          o += ps
+                          x++
+                      }
+                  }
+                  aNn = nn; aZn = nz
+
+                  // стрелка: линия по пикселям -> ось качания и угол
+                  if (nn >= Tune.TRACK_MIN_PX) analyzeNeedle(nn)
+
+                  // зона: центр и угловая ширина
+                  if (nz >= Tune.ZONE_MIN_PX) {
+                      // грубый центр зоны, потом отбрасываем одиночные пиксели-помехи
+                      var sx = 0L; var sy = 0L
+                      for (i in 0 until nz) { sx += zxs[i]; sy += zys[i] }
+                      var cx = sx.toFloat() / nz
+                      var cy = sy.toFloat() / nz
+                      var sd = 0f
+                      for (i in 0 until nz) sd += hypot(zxs[i] - cx, zys[i] - cy)
+                      val lim = 2f * (sd / nz) + 5f
+                      var sx2 = 0L; var sy2 = 0L; var n2 = 0
+                      for (i in 0 until nz) {
+                          if (hypot(zxs[i] - cx, zys[i] - cy) <= lim) { sx2 += zxs[i]; sy2 += zys[i]; n2++ }
+                      }
+                      if (n2 >= 10) { cx = sx2.toFloat() / n2; cy = sy2.toFloat() / n2 }
+                      aZx = cx; aZy = cy
+                      if (havePivot) {
+                          var amin = 999.0; var amax = -999.0
+                          for (i in 0 until nz) {
+                              if (hypot(zxs[i] - cx, zys[i] - cy) > lim) continue
+                              val a = Math.toDegrees(atan2((zxs[i] - pivX).toDouble(), (pivY - zys[i]).toDouble()))
+                              if (a < amin) amin = a
+                              if (a > amax) amax = a
+                          }
+                          aPhi = Math.toDegrees(atan2((cx - pivX).toDouble(), (pivY - cy).toDouble())).toFloat()
+                          if (amax > amin) aHalf = max(1.5f, ((amax - amin) / 2.0).toFloat())
+                      }
+                  }
+                  1
+              }
+
+              // [ЗРЕНИЕ] Линия стрелки (метод главных осей с отбраковкой выбросов).
+              // Пока ось неизвестна, собираем пересечение линий: ось = точка, через которую проходят все положения стрелки.
+              // Когда ось известна, угол стрелки = направление от оси на центр красных пикселей.
+              private fun analyzeNeedle(nn: Int) {
+                  var mx = 0.0; var my = 0.0
+                  for (i in 0 until nn) { mx += nxs[i]; my += nys[i] }
+                  mx /= nn; my /= nn
+                  val lim = max(3.0, fw * 0.012)
+                  var ux = 0.0; var uy = -1.0; var elong = 0.0; var cnt = nn
+                  for (pass in 0..1) {
+                      if (pass == 1) {
+                          var sx = 0.0; var sy = 0.0; var c = 0
+                          for (i in 0 until nn) {
+                              if (abs((nxs[i] - mx) * uy - (nys[i] - my) * ux) <= lim) { sx += nxs[i]; sy += nys[i]; c++ }
+                          }
+                          if (c < Tune.TRACK_MIN_PX) return
+                          mx = sx / c; my = sy / c; cnt = c
+                      }
+                      var sxx = 0.0; var sxy = 0.0; var syy = 0.0
+                      for (i in 0 until nn) {
+                          val ex = nxs[i] - mx
+                          val ey = nys[i] - my
+                          if (pass == 1 && abs(ex * uy - ey * ux) > lim) continue
+                          sxx += ex * ex; sxy += ex * ey; syy += ey * ey
+                      }
+                      val half = (sxx + syy) / 2.0
+                      val rr = sqrt(((sxx - syy) / 2.0) * ((sxx - syy) / 2.0) + sxy * sxy)
+                      val l1 = half + rr
+                      val l2 = max(half - rr, 1e-3)
+                      val a = 0.5 * atan2(2.0 * sxy, sxx - syy)
+                      ux = cos(a); uy = sin(a); elong = l1 / l2
+                  }
+
+                  if (!havePivot && cnt >= Tune.PIVOT_MIN_PX && elong >= 25.0) {
+                      val nx = -uy
+                      val ny = ux
+                      val b = nx * mx + ny * my
+                      pSxx += nx * nx; pSxy += nx * ny; pSyy += ny * ny
+                      pBx += nx * b; pBy += ny * b; pN++
+                      var ang = Math.toDegrees(atan2(uy, ux)).toFloat()
+                      if (ang < 0f) ang += 180f
+                      if (ang >= 180f) ang -= 180f
+                      if (ang < pMinA) pMinA = ang
+                      if (ang > pMaxA) pMaxA = ang
+                      if (pN >= Tune.PIVOT_MIN_LINES && pMaxA - pMinA >= Tune.PIVOT_MIN_SPREAD_DEG) {
+                          val det = pSxx * pSyy - pSxy * pSxy
+                          if (det > 1e-3 * pN.toDouble() * pN) {
+                              pivX = ((pSyy * pBx - pSxy * pBy) / det).toFloat()
+                              pivY = ((pSxx * pBy - pSxy * pBx) / det).toFloat()
+                              havePivot = true
+                          }
+                      }
+                  }
+                  if (havePivot) {
+                      aTh = Math.toDegrees(atan2(mx - pivX, pivY - my)).toFloat()
+                      aHaveTh = true
+                  }
+              }
+
+              // [ТРАЕКТОРИЯ] Забываем всё про текущий проход стрелки (после разворота-прыжка или нового раунда).
+              private fun resetSweep() {
+                  tkN = 0; swDir = 0; lastTh = Float.NaN
+              }
+
+              // Новый раунд (попали): стрелка ускоряется, поэтому скорость учим заново, но с подсказкой «чуть быстрее прежней».
+              private fun newRound() {
+                  omegaPrior = if (omega > 0f) omega * Tune.OMEGA_STEP_UP else 0f
+                  omega = 0f; omegaN = 0
+                  resetSweep()
+              }
+
+              private fun resetTracking() {
+                  waitChange = false; blockUntilNs = 0L; prevZx = -1f
+                  seenN = false; seenZ = false; calibPending = false
+                  resetSweep()
+                  omega = 0f; omegaN = 0; omegaPrior = 0f; bAng = Tune.BOUND_START_DEG
+                  hits = 0; misses = 0; turns = 0
+                  pSxx = 0.0; pSxy = 0.0; pSyy = 0.0; pBx = 0.0; pBy = 0.0; pN = 0
+                  pMinA = 999f; pMaxA = -999f
+                  havePivot = false
+                  if (Tune.FIXED_PIVOT_X >= 0f && Tune.FIXED_PIVOT_Y >= 0f) {
+                      pivX = Tune.FIXED_PIVOT_X; pivY = Tune.FIXED_PIVOT_Y; havePivot = true
+                  }
+              }
+
+              // [ТРАЕКТОРИЯ + РАЗВОРОТ + СКОРОСТЬ]
+              // Вызывается для каждого кадра. Одинаковые кадры (игра обновляет стрелку реже, чем идёт запись) пропускаем.
+              // Новый «шаг» стрелки:
+              //  - знак изменения угла поменялся -> РАЗВОРОТ: старая траектория забыта, край качания уточнён
+              //  - угол прыгнул больше TURN_RESTART_JUMP_DEG -> стрелка начала заново, всё забыто
+              //  - иначе точка добавляется в текущий проход, из неё считается скорость (наклон прямой угол/время)
+              private fun trackTick(frameNs: Long, th: Float, nowNs: Long) {
+                  if (!lastTh.isNaN()) {
+                      val d = th - lastTh
+                      if (abs(d) < Tune.DUP_DEG) return
+                      if (abs(d) > Tune.TURN_RESTART_JUMP_DEG) {
+                          resetSweep()
+                      } else {
+                          val dir = if (d > 0f) 1 else -1
+                          if (swDir != 0 && dir != swDir) {
+                              // на краю последняя точка прижата к границе: по ней уточняем границу качания
+                              if (abs(lastTh) > Tune.BOUND_LEARN_MIN_DEG) bAng = bAng * 0.7f + abs(lastTh) * 0.3f
+                              tkN = 0
+                              turns++
+                          }
+                          swDir = dir
+                      }
+                  }
+                  lastTh = th
+                  lastTickNs = nowNs
+                  if (tkN == tkT.size) {
+                      for (i in 1 until tkT.size) { tkT[i - 1] = tkT[i]; tkA[i - 1] = tkA[i] }
+                      tkN--
+                  }
+                  tkT[tkN] = frameNs; tkA[tkN] = th; tkN++
+
+                  // скорость: МНК-наклон угла по времени за последние шаги прохода
+                  if (tkN >= Tune.REGRESS_MIN_TICKS) {
+                      val k = min(tkN, 6)
+                      val s0 = tkN - k
+                      var mt = 0.0; var ma = 0.0
+                      for (i in 0 until k) { mt += tkT[s0 + i]; ma += tkA[s0 + i] }
+                      mt /= k; ma /= k
+                      var num = 0.0; var den = 0.0
+                      for (i in 0 until k) {
+                          val dt = (tkT[s0 + i] - mt) / 1e9
+                          num += dt * (tkA[s0 + i] - ma); den += dt * dt
+                      }
+                      if (den > 0.0) {
+                          val m = abs(num / den).toFloat()
+                          if (m >= Tune.OMEGA_MIN_DEG_S && m <= Tune.OMEGA_MAX_DEG_S) {
+                              omega = if (omegaN == 0) (if (omegaPrior > 0f) 0.5f * omegaPrior + 0.5f * m else m)
+                                      else omega + (Tune.OMEGA_EMA * (m - omega)).toFloat()
+                              omegaN++
+                              lastSpeed = omega
+                          }
+                      }
+                  }
+              }
+
+              // скорость, которой сейчас можно верить (°/с), или 0
+              private fun currentOmega(): Float {
+                  if (omegaN > 0) return omega
+                  if (omegaPrior > 0f) return omegaPrior
+                  if (tkN >= 2) {
+                      val dt = (tkT[tkN - 1] - tkT[tkN - 2]) / 1e9f
+                      if (dt > 0f) return abs(tkA[tkN - 1] - tkA[tkN - 2]) / dt
+                  }
+                  return 0f
+              }
+
+              // [ПРОГНОЗ] Длина пути стрелки до угла z, считая отражение от краёв ±b (стрелка разворачивается на краю).
+              private fun pathDistance(a: Float, z: Float, dir: Int, b: Float): Float =
+                  if (dir > 0) { if (z >= a) z - a else (b - a) + (b - z) }
+                  else { if (z <= a) a - z else (a + b) + (z + b) }
+
+              // точное ожидание до момента нажатия (сон до последних 3 мс, дальше активное ожидание)
+              private fun waitUntil(tNs: Long) {
+                  while (running) {
+                      val rem = tNs - System.nanoTime()
+                      if (rem <= 0L) return
+                      if (rem > 3_000_000L) Thread.sleep(1) else Thread.yield()
+                  }
+              }
+
+              private fun tickContact() {
+                  if (analyzeFrame() == 0) { Thread.sleep(1); return }
+                  val nowNs = System.nanoTime()
+                  seenN = aNn >= Tune.TRACK_MIN_PX
+                  seenZ = aZn >= Tune.ZONE_MIN_PX
+                  // время кадра (если часы кадра и System.nanoTime не совпали — берём текущее)
+                  val frameNs = if (aTs > 0 && abs(nowNs - aTs) < 500_000_000L) aTs else nowNs
+
+                  // зона прыгнула -> новый раунд, старая траектория не нужна
+                  if (seenZ && prevZx >= 0f && hypot(aZx - prevZx, aZy - prevZy) > 30f) resetSweep()
+                  if (seenZ) { prevZx = aZx; prevZy = aZy } else prevZx = -1f
+
+                  val haveAngle = seenN && aHaveTh
+                  if (haveAngle) trackTick(frameNs, aTh, nowNs)
+
+                  // самонастройка: после нажатия стрелка замирает; по месту остановки уточняем упреждение
+                  if (calibPending) {
+                      val dtMs = (nowNs - fireNs) / 1e6
+                      if (dtMs > 900 || !seenZ) {
+                          calibPending = false
+                      } else if (haveAngle && dtMs > 60 && (nowNs - lastTickNs) / 1e6 >= Tune.CAL_STILL_MS) {
+                          calibPending = false
+                          if (fireOmega > Tune.OMEGA_MIN_DEG_S && Tune.CAL_GAIN > 0.0) {
+                              // early > 0: стрелка остановилась ДО центра зоны -> нажали рано -> упреждение уменьшить
+                              val early = (firePhi - aTh) * fireDir
+                              val errMs = early / fireOmega * 1000.0
+                              if (abs(errMs) < Tune.CAL_MAX_ERR_MS) {
+                                  leadMs = (leadMs - errMs * Tune.CAL_GAIN).toInt().coerceIn(0, Tune.LEAD_MAX_MS)
+                                  save()
+                              }
+                          }
+                      }
+                  }
+
+                  // после нажатия ждём: зона сменилась (попали) или стрелка бежит дальше (промах)
+                  if (waitChange) {
+                      val moved = seenZ && hypot(aZx - lastZx, aZy - lastZy) > 25f
+                      val dtMs = (nowNs - fireNs) / 1e6
+                      val stillRunning = haveAngle && dtMs > Tune.MISS_AFTER_MS && (nowNs - lastTickNs) / 1e6 < 100
+                      if (!seenZ || moved) {
+                          hits++
+                          if (dtMs < 1500) lat = if (lat < 0) dtMs else lat * 0.7 + dtMs * 0.3
+                          waitChange = false
+                          newRound()
+                      } else if (stillRunning) {
+                          misses++
+                          waitChange = false
+                      } else if (dtMs > 3000) {
+                          waitChange = false; resetSweep()
+                      } else return
+                  }
+                  if (nowNs < blockUntilNs) return
+                  if (!seenZ) { resetSweep(); return }
+                  if (!haveAngle || !havePivot) return   // ось ещё ищется (нужен один-два взмаха стрелки)
+
+                  // [ПРОГНОЗ] нужна известная скорость и хотя бы пара шагов после разворота
+                  val w = currentOmega()
+                  if (w < Tune.OMEGA_MIN_DEG_S || swDir == 0 || tkN < Tune.SWEEP_MIN_TICKS) return
+
+                  // уточнённый угол в момент последнего шага: усредняем все шаги прохода, сдвинутые вперёд по скорости
+                  // (так случайная неточность времени одного кадра усредняется)
+                  val k = min(tkN, 6)
+                  val tL = tkT[tkN - 1]
+                  var thHat = 0.0
+                  for (i in tkN - k until tkN) thHat += tkA[i] + swDir * w * ((tL - tkT[i]) / 1e9)
+                  thHat /= k
+
+                  // когда стрелка дойдёт до центра зоны (с учётом отражения от края) и когда надо нажать
+                  val dist = pathDistance(thHat.toFloat(), aPhi, swDir, bAng)
+                  val tCross = tL + (dist / w * 1e9).toLong()
+                  val tFire = tCross - leadMs * 1_000_000L
+                  val etaMs = (tFire - nowNs) / 1e6
+                  val halfMs = aHalf / w * 1000.0
+
+                  if (etaMs > Tune.COMMIT_MS) return                      // рано, ждём свежие кадры
+                  if (etaMs < -halfMs * Tune.LATE_TOL_FRAC) return        // опоздали -> ждём следующий проход, лучше не нажимать криво
+
+                  if (etaMs > 0) waitUntil(tFire)
+                  click()
+                  fireNs = System.nanoTime()
+                  blockUntilNs = fireNs + max(cool, 300L) * 1_000_000L
+                  waitChange = true; lastZx = aZx; lastZy = aZy
+                  fireDir = swDir; fireOmega = w; firePhi = aPhi
+                  calibPending = true
+                  lastSpeed = w
               }
 
               // ---------- окна ----------
@@ -655,8 +1166,15 @@ jobs:
                       pr.color = if (running) green else Color.WHITE
                       c.drawCircle(m, m, base, pr)
                       val col = color
-                      pr.style = Paint.Style.FILL; pr.color = col
-                      c.drawCircle(m, m, base * 0.58f, pr)
+                      pr.style = Paint.Style.FILL
+                      if (contactMode) {
+                          val rc = RectF(m - base * 0.58f, m - base * 0.58f, m + base * 0.58f, m + base * 0.58f)
+                          pr.color = col; c.drawArc(rc, 90f, 180f, true, pr)
+                          pr.color = color2; c.drawArc(rc, -90f, 180f, true, pr)
+                      } else {
+                          pr.color = col
+                          c.drawCircle(m, m, base * 0.58f, pr)
+                      }
                       val lum = Color.red(col) * 0.3 + Color.green(col) * 0.6 + Color.blue(col) * 0.1
                       pr.color = if (lum > 140) Color.BLACK else Color.WHITE
                       if (running) {
@@ -670,6 +1188,13 @@ jobs:
                           path.lineTo(m - s * 0.7f, m + s)
                           path.close()
                           c.drawPath(path, pr)
+                      }
+                      if (running && contactMode) {
+                          pr.style = Paint.Style.FILL
+                          pr.color = if (seenN) color else Color.DKGRAY
+                          c.drawCircle(m - m * 0.28f, w * 0.93f, m * 0.13f, pr)
+                          pr.color = if (seenZ) color2 else Color.DKGRAY
+                          c.drawCircle(m + m * 0.28f, w * 0.93f, m * 0.13f, pr)
                       }
                       if (ClickerAccessibility.inst == null) {
                           pr.style = Paint.Style.FILL; pr.color = Color.parseColor("#E53935")
@@ -785,7 +1310,21 @@ jobs:
                       Act("💧", Color.parseColor("#1E88E5"), -135) { startPipette() },
                       Act("🎯", Color.parseColor("#43A047"), -45) { aimAction() },
                       Act("🔍", Color.parseColor("#8E24AA"), 135) { cycleSize() },
-                      Act("✕", Color.parseColor("#E53935"), 45) { stopSelf() }
+                      Act("✕", Color.parseColor("#E53935"), 45) { stopSelf() },
+                      Act(if (contactMode) "⚡" else "◉", Color.parseColor("#F9A825"), 90) {
+                          contactMode = !contactMode
+                          save(); bubble.invalidate()
+                          toast(if (contactMode) "Режим: контакт двух цветов (стрелка + зона)" else "Режим: один цвет")
+                          collapse()
+                      },
+                      Act("⏪", Color.parseColor("#FB8C00"), 180) {
+                          leadMs = min(Tune.LEAD_MAX_MS, leadMs + Tune.LEAD_STEP_MS); save()
+                          toast("Упреждение $leadMs мс — жмёт раньше"); keepMenu()
+                      },
+                      Act("⏩", Color.parseColor("#FB8C00"), 0) {
+                          leadMs = max(0, leadMs - Tune.LEAD_STEP_MS); save()
+                          toast("Упреждение $leadMs мс — жмёт позже"); keepMenu()
+                      }
                   )
                   var i = 0
                   for (act in acts) {
@@ -802,8 +1341,7 @@ jobs:
                           { palette.removeAll { it == c }; save(); collapse(false); expand() })
                   }
                   bubble.bringToFront()
-                  ui.removeCallbacks(menuClose)
-                  ui.postDelayed(menuClose, 7000)
+                  keepMenu()
               }
 
               private fun collapse(animated: Boolean = true) {
@@ -826,46 +1364,73 @@ jobs:
                   ui.postDelayed(finish, 160)
               }
 
-              // ---------- пипетка: коснись любого места экрана ----------
+              // ---------- пипетка с лупой ----------
               private inner class PipetteView : View(this@OverlayService) {
                   private val p = Paint(Paint.ANTI_ALIAS_FLAG)
                   private var fxp = -1f
                   private var fyp = -1f
                   private var cc = 0
+                  private var cells: IntArray? = null
 
                   override fun onDraw(c: Canvas) {
                       val d = resources.displayMetrics.density
                       val w = width.toFloat()
+                      val hint = if (!contactMode) "Коснись нужного цвета и отпусти"
+                          else if (pipStep == 1) "1 из 2: коснись СТРЕЛКИ (тонкой линии)"
+                          else "2 из 2: коснись ЗОНЫ (подсвеченной области)"
+                      p.textSize = 14 * d; p.textAlign = Paint.Align.CENTER
+                      val tw = p.measureText(hint)
                       p.style = Paint.Style.FILL; p.color = Color.parseColor("#CC000000")
-                      c.drawRoundRect(RectF(w / 2f - 150 * d, 40 * d, w / 2f + 150 * d, 84 * d), 22 * d, 22 * d, p)
-                      p.color = Color.WHITE; p.textSize = 14 * d; p.textAlign = Paint.Align.CENTER
-                      c.drawText("Коснись нужного цвета и отпусти", w / 2f, 68 * d, p)
+                      c.drawRoundRect(RectF(w / 2f - tw / 2f - 20 * d, 40 * d, w / 2f + tw / 2f + 20 * d, 84 * d), 22 * d, 22 * d, p)
+                      p.color = Color.WHITE
+                      c.drawText(hint, w / 2f, 68 * d, p)
                       p.color = Color.parseColor("#CCE53935")
                       c.drawCircle(w - 40 * d, 62 * d, 24 * d, p)
                       p.color = Color.WHITE; p.textSize = 20 * d
                       c.drawText("✕", w - 40 * d, 69 * d, p)
-                      if (fxp >= 0f) {
-                          val sy = max(60f * d, fyp - 90 * d)
+
+                      val g = cells
+                      if (fxp >= 0f && g != null) {
+                          val n = 11
+                          val cs = 9 * d
+                          val size = n * cs
+                          var top = fyp - 140 * d - size / 2f
+                          if (top < 100 * d) top = fyp + 70 * d
+                          val left = (fxp - size / 2f).coerceIn(8 * d, w - size - 8 * d)
+                          p.style = Paint.Style.FILL; p.color = Color.parseColor("#EE000000")
+                          c.drawRect(left - 3 * d, top - 3 * d, left + size + 3 * d, top + size + 3 * d, p)
+                          for (i in 0 until n * n) {
+                              val v = g[i]
+                              p.color = if (v == 0) Color.DKGRAY else v
+                              val cx0 = left + (i % n) * cs
+                              val cy0 = top + (i / n) * cs
+                              c.drawRect(cx0, cy0, cx0 + cs, cy0 + cs, p)
+                          }
+                          val mc = n / 2
+                          p.style = Paint.Style.STROKE; p.strokeWidth = 2 * d; p.color = Color.WHITE
+                          c.drawRect(left + mc * cs, top + mc * cs, left + (mc + 1) * cs, top + (mc + 1) * cs, p)
                           p.style = Paint.Style.FILL; p.color = cc
-                          c.drawCircle(fxp, sy, 34 * d, p)
-                          p.style = Paint.Style.STROKE; p.strokeWidth = 4 * d; p.color = Color.WHITE
-                          c.drawCircle(fxp, sy, 34 * d, p)
-                          p.strokeWidth = 2 * d
+                          c.drawCircle(left + size / 2f, top + size + 26 * d, 16 * d, p)
+                          p.style = Paint.Style.STROKE; p.color = Color.WHITE
+                          c.drawCircle(left + size / 2f, top + size + 26 * d, 16 * d, p)
                           c.drawCircle(fxp, fyp, 14 * d, p)
                       }
                   }
 
                   override fun onTouchEvent(e: MotionEvent): Boolean {
                       val d = resources.displayMetrics.density
+                      val rx = e.rawX.toInt()
+                      val ry = e.rawY.toInt()
                       when (e.action) {
                           MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
                               fxp = e.x; fyp = e.y
-                              cc = sample(e.rawX.toInt(), e.rawY.toInt())
+                              cells = grid(rx, ry, 11)
+                              cc = smartPick(rx, ry)
                               invalidate()
                           }
                           MotionEvent.ACTION_UP -> {
                               val cancel = e.x > width - 80 * d && e.y < 110 * d
-                              val got = sample(e.rawX.toInt(), e.rawY.toInt())
+                              val got = smartPick(rx, ry)
                               ui.post { endPipette(if (cancel) null else got) }
                           }
                       }
@@ -876,27 +1441,42 @@ jobs:
               private fun startPipette() {
                   if (pipette != null) return
                   collapse(false)
+                  pipStep = 1
                   val v = PipetteView()
                   pipette = v
                   val q = lp(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, true, 0, 0)
                   q.alpha = 0.78f
                   try { wm.addView(v, q) } catch (e: Exception) { pipette = null; return }
-                  ui.postDelayed({ if (pipette === v) endPipette(null) }, 15000)
+                  ui.postDelayed({ if (pipette === v) closePipette() }, 30000)
+              }
+
+              private fun closePipette() {
+                  val v = pipette ?: return
+                  pipette = null
+                  try { wm.removeView(v) } catch (e: Exception) {}
               }
 
               private fun endPipette(c: Int?) {
                   val v = pipette ?: return
-                  pipette = null
-                  try { wm.removeView(v) } catch (e: Exception) {}
-                  if (c != null && c != 0) {
+                  if (c == null) { closePipette(); return }
+                  if (c == 0) { toast("Не удалось взять цвет, попробуй ещё раз"); return }
+                  addPalette(c)
+                  if (!contactMode) {
                       color = c
-                      addPalette(c)
-                      save()
-                      bubble.invalidate()
+                      closePipette()
                       toast("Цвет сохранён и выбран")
-                  } else if (c != null) {
-                      toast("Не удалось взять цвет, попробуй ещё раз")
+                  } else if (pipStep == 1) {
+                      color = c
+                      pipStep = 2
+                      v.invalidate()
+                      toast("Стрелка выбрана. Теперь коснись зоны")
+                  } else {
+                      color2 = c
+                      closePipette()
+                      toast("Готово: стрелка и зона выбраны")
                   }
+                  save()
+                  bubble.invalidate()
               }
 
               // ---------- сборка интерфейса ----------
@@ -950,11 +1530,14 @@ jobs:
                   bubble.sync()
                   bubble.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                   if (running) {
+                      resetTracking()
                       aiming = false
                       applyAim()
                   } else {
                       val l = if (lat > 0) lat.toInt().toString() + " мс" else "—"
-                      toast("Стоп. Нажатий: $clicks (ок $tapOk, отказ $tapFail), лаг: $l")
+                      toast("Стоп. Нажатий: $clicks (ок $tapOk, отказ $tapFail), попаданий: $hits, промахов: $misses, " +
+                          "лаг: $l, упреждение: $leadMs мс, скорость: ${lastSpeed.toInt()} °/с, разворотов: $turns, " +
+                          "ось: " + (if (havePivot) "${pivX.toInt()},${pivY.toInt()}" else "не найдена"))
                   }
               }
 
@@ -969,7 +1552,7 @@ jobs:
                   alive = false; running = false
                   ui.removeCallbacksAndMessages(null)
                   if (::hudRoot.isInitialized) save()
-                  pipette?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                  closePipette()
                   if (::moveH.isInitialized) { moveH.hide(); sizeH.hide(); targetH.hide() }
                   if (::frameV.isInitialized) try { wm.removeView(frameV) } catch (e: Exception) {}
                   if (::hudRoot.isInitialized) try { wm.removeView(hudRoot) } catch (e: Exception) {}
