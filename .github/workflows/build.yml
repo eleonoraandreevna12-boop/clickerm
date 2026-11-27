@@ -132,6 +132,7 @@ jobs:
               private lateinit var cool: EditText
               private lateinit var adapt: CheckBox
               private lateinit var disappear: CheckBox
+              private lateinit var lvlF: EditText
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
@@ -155,6 +156,7 @@ jobs:
                   tol = field("Допуск цвета (0-255)", sp.getInt("tol", 25).toString())
                   pre = field("Задержка до клика, мс", sp.getLong("pre", 0L).toString())
                   cool = field("Пауза после нажатия, мс (для стрелки и зоны 400-800)", sp.getLong("cool", 150L).toString())
+                  lvlF = field("Скорость стрелки на старте, 1-5 (после каждого попадания растёт сама)", sp.getInt("lvl", 1).toString())
                   adapt = CheckBox(this).apply { text = "Адаптация к задержке (повтор клика)"; isChecked = sp.getBoolean("adapt", true) }
                   root.addView(adapt)
                   disappear = CheckBox(this).apply { text = "Режим: кликать, когда цвет ИСЧЕЗ"; isChecked = sp.getBoolean("disappear", false) }
@@ -173,8 +175,8 @@ jobs:
                        "• Удержание — меню: 💧 пипетка с лупой (в режиме ⚡ два шага: сначала стрелка, потом зона), " +
                        "🎯 прицел (круг вокруг дуги: в круг должны попадать и стрелка, и зона), 🔍 размер кружка, ⚡ режим (два цвета / один цвет), " +
                        "⏪ ⏩ упреждение: ⏪ жмёт раньше, ⏩ позже, ✕ выход.\n" +
-                       "• Внизу кружка при работе две точки: видно ли стрелку и зону.\n" +
-                       "• После старта первые 1–2 взмаха стрелки уходят на поиск оси качания, потом включается прицеливание.\n" +
+                       "• Внизу кружка при работе три точки: видно ли стрелку, готово ли слежение (зелёная), видно ли зону.\n" +
+                       "• Круг должен охватывать зону и дугу вокруг неё примерно на ±45°: стрелку надо увидеть заранее, за ~150 мс до зоны.\n" +
                        "• Скорость стрелки считается по шагам, разворот на краю замечается сразу, упреждение подстраивается само по месту остановки стрелки.\n" +
                        "• Сохранённые цвета — точки вокруг кружка. Тап — выбрать, удержание — удалить.")
                   setContentView(ScrollView(this).apply { addView(root) })
@@ -197,13 +199,14 @@ jobs:
                       val t = tol.text.toString().toIntOrNull() ?: 25
                       val p = pre.text.toString().toLongOrNull() ?: 0L
                       val c = cool.text.toString().toLongOrNull() ?: 150L
+                      val lv = (lvlF.text.toString().toIntOrNull() ?: 1).coerceIn(1, 5)
                       getSharedPreferences("kl", MODE_PRIVATE).edit()
-                          .putInt("tol", t).putLong("pre", p).putLong("cool", c)
+                          .putInt("tol", t).putLong("pre", p).putLong("cool", c).putInt("lvl", lv)
                           .putBoolean("adapt", adapt.isChecked).putBoolean("disappear", disappear.isChecked)
                           .apply()
                       val i = Intent(this, OverlayService::class.java)
                           .putExtra("code", res).putExtra("data", data)
-                          .putExtra("tol", t).putExtra("pre", p).putExtra("cool", c)
+                          .putExtra("tol", t).putExtra("pre", p).putExtra("cool", c).putExtra("lvl", lv)
                           .putExtra("adapt", adapt.isChecked)
                           .putExtra("disappear", disappear.isChecked)
                       startForegroundService(i)
@@ -261,34 +264,37 @@ jobs:
 
           // =====================================================================================
           //  НАСТРОЙКИ ТОЧНОСТИ (всё, что можно подкрутить, собрано здесь)
-          //  Что измерено по видео: стрелка крутится вокруг неподвижной оси, идёт с ПОСТОЯННОЙ скоростью
-          //  между краями примерно ±58° и мгновенно разворачивается на краю. После каждого попадания
-          //  скорость растёт (≈165 → 200 → 235 → 270 °/с), а зона сужается (≈21° → 16° → 11° → 7°).
-          //  Игра обновляет стрелку реже, чем идут кадры записи экрана: часть кадров одинаковая.
+          //  Что измерено по видео: стрелка крутится вокруг неподвижной оси, идёт с ПОСТОЯННОЙ скоростью между
+          //  краями примерно ±58° и мгновенно разворачивается на краю. После каждого попадания скорость растёт,
+          //  а зона сужается. Игра обновляет стрелку реже, чем идут кадры записи экрана: часть кадров одинаковая.
+          //
+          //  КАК ЭТО РАБОТАЕТ: линия стрелки всегда проходит через ось качания. Когда стрелка «совпала» с зоной,
+          //  эта линия проходит через центр зоны. Поэтому следим за одной величиной e = расстояние (со знаком, px)
+          //  от центра зоны до линии стрелки. e = 0 — стрелка точно на зоне. Ось и углы искать не нужно.
           // =====================================================================================
           private object Tune {
+              // --- пять скоростей стрелки, °/с ---
+              // Первые четыре измерены по видео: 170, 203, 238, 275 (шаг растёт: +34, +35, +37).
+              // Пятая — оценка по тому же тренду: 275 + ~38 ≈ 312 °/с. Если в игре иначе — поправь число.
+              // Используется как подсказка: после каждого попадания скорость ждём в нужное число раз больше.
+              val SPEED_DEG_S = floatArrayOf(170f, 203f, 238f, 275f, 312f)
+
               // --- чувствительность зрения ---
               const val MIN_COLOR_TOL = 40        // минимальный допуск цвета (0-255). Мало цвета найдено -> больше; ловит фон -> меньше
-              const val TRACK_MIN_PX = 6          // сколько пикселей стрелки нужно, чтобы считать её найденной
-              const val ZONE_MIN_PX = 25          // сколько пикселей зоны нужно, чтобы считать зону найденной
-              const val PIVOT_MIN_PX = 40         // сколько пикселей стрелки нужно, чтобы использовать кадр для поиска оси
-              const val PIVOT_MIN_LINES = 20      // сколько кадров собрать, прежде чем считать ось найденной
-              const val PIVOT_MIN_SPREAD_DEG = 40f // на какой угол стрелка должна качнуться, чтобы ось нашлась честно
-              // Ось качания стрелки можно задать руками (в пикселях экрана). -1 = искать автоматически.
-              const val FIXED_PIVOT_X = -1f
-              const val FIXED_PIVOT_Y = -1f
+              const val TRACK_MIN_PX = 6          // пикселей стрелки, чтобы горела точка «вижу стрелку»
+              const val LINE_MIN_PX = 15          // пикселей стрелки, чтобы провести через них линию
+              const val LINE_MIN_ELONG = 8.0      // линия должна быть вытянутой (длина/толщина), иначе это не стрелка
+              const val ZONE_MIN_PX = 25          // пикселей зоны, чтобы считать зону найденной
 
-              // --- слежение за траекторией ---
-              const val DUP_DEG = 1.2f            // изменение угла меньше этого = «тот же кадр». Больше -> меньше шума, но грубее
-              const val TURN_RESTART_JUMP_DEG = 25f // прыжок угла больше этого = стрелка начала заново (новый раунд)
-              const val BOUND_START_DEG = 60f     // начальное значение края качания, дальше уточняется само
-              const val BOUND_LEARN_MIN_DEG = 35f // разворот считается «краем» только за этим углом
-              const val REGRESS_MIN_TICKS = 4     // сколько шагов стрелки нужно для оценки скорости
+              // --- слежение за траекторией (e в пикселях экрана) ---
+              const val DUP_PX = 2.0f             // изменение e меньше этого = «тот же кадр». Больше -> меньше шума, но грубее
+              const val GAP_RESET_MS = 250        // стрелку не видно дольше этого -> новый проход, старое забыто
+              const val REGRESS_MIN_TICKS = 3     // сколько шагов нужно, чтобы пересчитать скорость
               const val SWEEP_MIN_TICKS = 2       // сколько шагов после разворота нужно, чтобы уже целиться
-              const val OMEGA_EMA = 0.35          // как быстро скорость подстраивается (0.1 плавно ... 0.6 резко)
-              const val OMEGA_STEP_UP = 1.15f     // после попадания скорость растёт примерно на столько (стартовая догадка)
-              const val OMEGA_MIN_DEG_S = 30f
-              const val OMEGA_MAX_DEG_S = 1500f
+              const val SPEED_EMA = 0.35          // как быстро скорость подстраивается (0.1 плавно ... 0.6 резко)
+              const val SPEED_OUTLIER = 0.4       // измерение, отличающееся от прежней скорости больше чем на 40%, пропускаем
+              const val SPEED_E_FRAC = 0.6f       // скорость пересчитываем, пока стрелка ближе этой доли радиуса круга к зоне
+              const val SPEED_MIN_PX_S = 60f      // медленнее этого стрелкой не считаем
 
               // --- время нажатия ---
               const val COMMIT_MS = 45            // за сколько мс до нажатия «фиксируем» момент и ждём точно. Не меньше шага кадров игры
@@ -301,6 +307,7 @@ jobs:
               const val CAL_MAX_ERR_MS = 120.0    // ошибки больше этой считаем случайностью
               const val CAL_STILL_MS = 120        // стрелка не двигалась столько мс = остановилась
               const val MISS_AFTER_MS = 350       // стрелка всё ещё бежит через столько мс после нажатия = промах
+              const val MISS_OUT_MS = 700         // стрелка пропала из круга, а зона не сменилась за столько мс = промах
           }
 
           class OverlayService : Service() {
@@ -364,38 +371,37 @@ jobs:
               private var fireNs = 0L
               private var blockUntilNs = 0L
 
-              // ---- ось качания стрелки: ищется сама как точка пересечения всех линий стрелки ----
-              private var havePivot = false
-              private var pivX = 0f
-              private var pivY = 0f
-              private var pSxx = 0.0; private var pSxy = 0.0; private var pSyy = 0.0
-              private var pBx = 0.0; private var pBy = 0.0
-              private var pN = 0
-              private var pMinA = 999f; private var pMaxA = -999f
-
-              // ---- угол стрелки и зоны относительно оси (0° = вверх, + = вправо) ----
-              private var aHaveTh = false
-              private var aTh = 0f          // угол стрелки в этом кадре
-              private var aPhi = 0f         // угол центра зоны
-              private var aHalf = 3f        // половина ширины зоны, градусы
+              // ---- линия стрелки и зона (ось качания не нужна) ----
+              private var aHaveE = false
+              private var aE = 0f           // e: расстояние от центра зоны до линии стрелки со знаком, px
+              private var aHalfPx = 8f      // полуширина зоны поперёк стрелки, px
+              private var zLim = 0f
+              private var prevUx = 0.0      // направление линии в прошлом кадре: держим знак e постоянным
+              private var prevUy = -1.0
 
               // ---- траектория: шаги стрелки с последнего разворота ----
-              private var lastTh = Float.NaN
-              private var swDir = 0         // +1 вправо, -1 влево, 0 пока неизвестно
+              private var lastE = Float.NaN
+              private var swDir = 0         // знак изменения e: +1 / -1, 0 пока неизвестно
               private val tkT = LongArray(8)
-              private val tkA = FloatArray(8)
+              private val tkE = FloatArray(8)
               private var tkN = 0
               private var lastTickNs = 0L
-              private var omega = 0f        // скорость стрелки, °/с (сглаженная)
-              private var omegaN = 0
-              private var omegaPrior = 0f   // догадка о скорости на новом уровне
-              private var bAng = Tune.BOUND_START_DEG
+              private var speed = 0f        // скорость e около зоны, px/с (сглаженная)
+              private var speedN = 0
+              private var speedRej = 0
+              private var speedPrior = 0f   // догадка о скорости на новом уровне
+              private var lvl = 0           // номер скорости 0..4 (на экране 1..5)
+              private var startLvl = 0
               private var turns = 0
+              private var lateNoted = false
+              @Volatile private var skippedLate = 0
+              @Volatile private var ready = false
+              @Volatile private var framesAll = 0
+              @Volatile private var framesLine = 0
 
               // ---- что было в момент последнего нажатия (для самонастройки) ----
               private var fireDir = 0
-              private var fireOmega = 0f
-              private var firePhi = 0f
+              private var fireSpeed = 0f
 
               private val palette = ArrayList<Int>()
               private var aiming = true
@@ -428,6 +434,7 @@ jobs:
                   cool = i.getLongExtra("cool", 150)
                   adapt = i.getBooleanExtra("adapt", true)
                   wantPresent = !i.getBooleanExtra("disappear", false)
+                  startLvl = (i.getIntExtra("lvl", 1) - 1).coerceIn(0, 4)
                   startFg()
                   load()
 
@@ -554,7 +561,7 @@ jobs:
                       clampAll()
                       hudX = if (hudX + bubbleSize() / 2 < W / 2) 0 else W - bubbleSize()
                       relayoutAll()
-                      resetTracking() // ось стрелки после поворота экрана другая
+                      resetSweep(); speed = 0f; speedN = 0; speedPrior = 0f // после поворота экрана пиксели другие
                   }
               }
 
@@ -695,7 +702,8 @@ jobs:
 
               // ---------- контакт двух цветов: стрелка + зона ----------
 
-              // [ЗРЕНИЕ] Один кадр: находим пиксели стрелки и зоны, из них считаем углы вокруг оси качания.
+              // [ЗРЕНИЕ] Один кадр: находим пиксели стрелки и зоны. Из них получаем одну величину e —
+              // расстояние (со знаком) от центра зоны до линии стрелки. e == 0 значит «стрелка на зоне».
               private fun analyzeFrame(): Int = synchronized(lock) {
                   val n = try { reader?.acquireLatestImage() } catch (e: Exception) { null }
                   if (n == null) return 0
@@ -711,7 +719,7 @@ jobs:
                   val x1 = min(n.width, bx + fw)
                   val y1 = min(n.height, by + fh)
                   aTs = n.timestamp
-                  aNn = 0; aZn = 0; aHaveTh = false
+                  aNn = 0; aZn = 0; aHaveE = false
                   if (x1 - x0 < 8 || y1 - y0 < 8) return 1
                   val need = (x1 - x0) * ps
                   if (rowBuf.size < need) rowBuf = ByteArray(need)
@@ -756,12 +764,8 @@ jobs:
                   }
                   aNn = nn; aZn = nz
 
-                  // стрелка: линия по пикселям -> ось качания и угол
-                  if (nn >= Tune.TRACK_MIN_PX) analyzeNeedle(nn)
-
-                  // зона: центр и угловая ширина
+                  // зона: центр (одиночные пиксели-помехи отбрасываем)
                   if (nz >= Tune.ZONE_MIN_PX) {
-                      // грубый центр зоны, потом отбрасываем одиночные пиксели-помехи
                       var sx = 0L; var sy = 0L
                       for (i in 0 until nz) { sx += zxs[i]; sy += zys[i] }
                       var cx = sx.toFloat() / nz
@@ -774,25 +778,16 @@ jobs:
                           if (hypot(zxs[i] - cx, zys[i] - cy) <= lim) { sx2 += zxs[i]; sy2 += zys[i]; n2++ }
                       }
                       if (n2 >= 10) { cx = sx2.toFloat() / n2; cy = sy2.toFloat() / n2 }
-                      aZx = cx; aZy = cy
-                      if (havePivot) {
-                          var amin = 999.0; var amax = -999.0
-                          for (i in 0 until nz) {
-                              if (hypot(zxs[i] - cx, zys[i] - cy) > lim) continue
-                              val a = Math.toDegrees(atan2((zxs[i] - pivX).toDouble(), (pivY - zys[i]).toDouble()))
-                              if (a < amin) amin = a
-                              if (a > amax) amax = a
-                          }
-                          aPhi = Math.toDegrees(atan2((cx - pivX).toDouble(), (pivY - cy).toDouble())).toFloat()
-                          if (amax > amin) aHalf = max(1.5f, ((amax - amin) / 2.0).toFloat())
-                      }
+                      aZx = cx; aZy = cy; zLim = lim
                   }
+
+                  // стрелка: линия по пикселям, потом e
+                  if (nn >= Tune.TRACK_MIN_PX && nz >= Tune.ZONE_MIN_PX) analyzeNeedle(nn)
                   1
               }
 
-              // [ЗРЕНИЕ] Линия стрелки (метод главных осей с отбраковкой выбросов).
-              // Пока ось неизвестна, собираем пересечение линий: ось = точка, через которую проходят все положения стрелки.
-              // Когда ось известна, угол стрелки = направление от оси на центр красных пикселей.
+              // [ЗРЕНИЕ] Линия стрелки: метод главных осей с отбраковкой выбросов (фон с похожим цветом).
+              // Знак e держим постоянным: направление линии берём так, чтобы оно совпадало с прошлым кадром.
               private fun analyzeNeedle(nn: Int) {
                   var mx = 0.0; var my = 0.0
                   for (i in 0 until nn) { mx += nxs[i]; my += nys[i] }
@@ -805,7 +800,7 @@ jobs:
                           for (i in 0 until nn) {
                               if (abs((nxs[i] - mx) * uy - (nys[i] - my) * ux) <= lim) { sx += nxs[i]; sy += nys[i]; c++ }
                           }
-                          if (c < Tune.TRACK_MIN_PX) return
+                          if (c < Tune.LINE_MIN_PX) return
                           mx = sx / c; my = sy / c; cnt = c
                       }
                       var sxx = 0.0; var sxy = 0.0; var syy = 0.0
@@ -822,42 +817,35 @@ jobs:
                       val a = 0.5 * atan2(2.0 * sxy, sxx - syy)
                       ux = cos(a); uy = sin(a); elong = l1 / l2
                   }
-
-                  if (!havePivot && cnt >= Tune.PIVOT_MIN_PX && elong >= 25.0) {
-                      val nx = -uy
-                      val ny = ux
-                      val b = nx * mx + ny * my
-                      pSxx += nx * nx; pSxy += nx * ny; pSyy += ny * ny
-                      pBx += nx * b; pBy += ny * b; pN++
-                      var ang = Math.toDegrees(atan2(uy, ux)).toFloat()
-                      if (ang < 0f) ang += 180f
-                      if (ang >= 180f) ang -= 180f
-                      if (ang < pMinA) pMinA = ang
-                      if (ang > pMaxA) pMaxA = ang
-                      if (pN >= Tune.PIVOT_MIN_LINES && pMaxA - pMinA >= Tune.PIVOT_MIN_SPREAD_DEG) {
-                          val det = pSxx * pSyy - pSxy * pSxy
-                          if (det > 1e-3 * pN.toDouble() * pN) {
-                              pivX = ((pSyy * pBx - pSxy * pBy) / det).toFloat()
-                              pivY = ((pSxx * pBy - pSxy * pBx) / det).toFloat()
-                              havePivot = true
-                          }
-                      }
+                  if (cnt < Tune.LINE_MIN_PX || elong < Tune.LINE_MIN_ELONG) return
+                  if (ux * prevUx + uy * prevUy < 0.0) { ux = -ux; uy = -uy }
+                  prevUx = ux; prevUy = uy
+                  val nx = -uy
+                  val ny = ux
+                  aE = ((aZx - mx) * nx + (aZy - my) * ny).toFloat()
+                  // полуширина зоны поперёк стрелки: нужна, чтобы знать, сколько мс можно ошибиться
+                  var pmin = 1e9; var pmax = -1e9
+                  for (i in 0 until aZn) {
+                      if (hypot(zxs[i] - aZx, zys[i] - aZy) > zLim) continue
+                      val p = (zxs[i] - aZx) * nx + (zys[i] - aZy) * ny
+                      if (p < pmin) pmin = p
+                      if (p > pmax) pmax = p
                   }
-                  if (havePivot) {
-                      aTh = Math.toDegrees(atan2(mx - pivX, pivY - my)).toFloat()
-                      aHaveTh = true
-                  }
+                  if (pmax > pmin) aHalfPx = max(2f, ((pmax - pmin) / 2.0).toFloat())
+                  aHaveE = true
               }
 
-              // [ТРАЕКТОРИЯ] Забываем всё про текущий проход стрелки (после разворота-прыжка или нового раунда).
+              // [ТРАЕКТОРИЯ] Забываем текущий проход стрелки (после разворота-прыжка, нового раунда или пропажи стрелки).
               private fun resetSweep() {
-                  tkN = 0; swDir = 0; lastTh = Float.NaN
+                  tkN = 0; swDir = 0; lastE = Float.NaN; lateNoted = false
               }
 
-              // Новый раунд (попали): стрелка ускоряется, поэтому скорость учим заново, но с подсказкой «чуть быстрее прежней».
+              // Новый раунд (попали): стрелка ускорилась. Скорость учим заново, но с подсказкой из таблицы пяти скоростей.
               private fun newRound() {
-                  omegaPrior = if (omega > 0f) omega * Tune.OMEGA_STEP_UP else 0f
-                  omega = 0f; omegaN = 0
+                  val step = if (lvl < 4) Tune.SPEED_DEG_S[lvl + 1] / Tune.SPEED_DEG_S[lvl] else 1f
+                  speedPrior = if (speed > 0f) speed * step else 0f
+                  if (lvl < 4) lvl++
+                  speed = 0f; speedN = 0; speedRej = 0
                   resetSweep()
               }
 
@@ -865,86 +853,80 @@ jobs:
                   waitChange = false; blockUntilNs = 0L; prevZx = -1f
                   seenN = false; seenZ = false; calibPending = false
                   resetSweep()
-                  omega = 0f; omegaN = 0; omegaPrior = 0f; bAng = Tune.BOUND_START_DEG
-                  hits = 0; misses = 0; turns = 0
-                  pSxx = 0.0; pSxy = 0.0; pSyy = 0.0; pBx = 0.0; pBy = 0.0; pN = 0
-                  pMinA = 999f; pMaxA = -999f
-                  havePivot = false
-                  if (Tune.FIXED_PIVOT_X >= 0f && Tune.FIXED_PIVOT_Y >= 0f) {
-                      pivX = Tune.FIXED_PIVOT_X; pivY = Tune.FIXED_PIVOT_Y; havePivot = true
-                  }
+                  speed = 0f; speedN = 0; speedRej = 0; speedPrior = 0f
+                  lvl = startLvl
+                  hits = 0; misses = 0; turns = 0; skippedLate = 0
+                  framesAll = 0; framesLine = 0; ready = false
+                  prevUx = 0.0; prevUy = -1.0
               }
 
               // [ТРАЕКТОРИЯ + РАЗВОРОТ + СКОРОСТЬ]
               // Вызывается для каждого кадра. Одинаковые кадры (игра обновляет стрелку реже, чем идёт запись) пропускаем.
               // Новый «шаг» стрелки:
-              //  - знак изменения угла поменялся -> РАЗВОРОТ: старая траектория забыта, край качания уточнён
-              //  - угол прыгнул больше TURN_RESTART_JUMP_DEG -> стрелка начала заново, всё забыто
-              //  - иначе точка добавляется в текущий проход, из неё считается скорость (наклон прямой угол/время)
-              private fun trackTick(frameNs: Long, th: Float, nowNs: Long) {
-                  if (!lastTh.isNaN()) {
-                      val d = th - lastTh
-                      if (abs(d) < Tune.DUP_DEG) return
-                      if (abs(d) > Tune.TURN_RESTART_JUMP_DEG) {
+              //  - знак изменения e поменялся -> РАЗВОРОТ: старая траектория забыта, скорость сохранена
+              //  - стрелки не было видно дольше GAP_RESET_MS или e прыгнул больше диаметра круга -> новый проход
+              //  - иначе точка добавляется в проход и пересчитывается скорость (наклон прямой e по времени)
+              private fun trackTick(frameNs: Long, e: Float, nowNs: Long) {
+                  if (!lastE.isNaN() && (nowNs - lastTickNs) / 1e6 > Tune.GAP_RESET_MS) resetSweep()
+                  if (!lastE.isNaN()) {
+                      val d = e - lastE
+                      if (abs(d) < Tune.DUP_PX) return
+                      if (abs(d) > fw) {
                           resetSweep()
                       } else {
                           val dir = if (d > 0f) 1 else -1
-                          if (swDir != 0 && dir != swDir) {
-                              // на краю последняя точка прижата к границе: по ней уточняем границу качания
-                              if (abs(lastTh) > Tune.BOUND_LEARN_MIN_DEG) bAng = bAng * 0.7f + abs(lastTh) * 0.3f
-                              tkN = 0
-                              turns++
-                          }
+                          if (swDir != 0 && dir != swDir) { tkN = 0; turns++; lateNoted = false }
                           swDir = dir
                       }
                   }
-                  lastTh = th
+                  lastE = e
                   lastTickNs = nowNs
                   if (tkN == tkT.size) {
-                      for (i in 1 until tkT.size) { tkT[i - 1] = tkT[i]; tkA[i - 1] = tkA[i] }
+                      for (i in 1 until tkT.size) { tkT[i - 1] = tkT[i]; tkE[i - 1] = tkE[i] }
                       tkN--
                   }
-                  tkT[tkN] = frameNs; tkA[tkN] = th; tkN++
+                  tkT[tkN] = frameNs; tkE[tkN] = e; tkN++
 
-                  // скорость: МНК-наклон угла по времени за последние шаги прохода
-                  if (tkN >= Tune.REGRESS_MIN_TICKS) {
+                  // скорость: МНК-наклон e по времени за последние шаги (пока стрелка не слишком далеко от зоны: там e почти линейно)
+                  if (tkN >= Tune.REGRESS_MIN_TICKS && abs(e) < Tune.SPEED_E_FRAC * fw / 2f) {
                       val k = min(tkN, 6)
                       val s0 = tkN - k
-                      var mt = 0.0; var ma = 0.0
-                      for (i in 0 until k) { mt += tkT[s0 + i]; ma += tkA[s0 + i] }
-                      mt /= k; ma /= k
+                      var mt = 0.0; var me = 0.0
+                      for (i in 0 until k) { mt += tkT[s0 + i]; me += tkE[s0 + i] }
+                      mt /= k; me /= k
                       var num = 0.0; var den = 0.0
                       for (i in 0 until k) {
                           val dt = (tkT[s0 + i] - mt) / 1e9
-                          num += dt * (tkA[s0 + i] - ma); den += dt * dt
+                          num += dt * (tkE[s0 + i] - me); den += dt * dt
                       }
                       if (den > 0.0) {
                           val m = abs(num / den).toFloat()
-                          if (m >= Tune.OMEGA_MIN_DEG_S && m <= Tune.OMEGA_MAX_DEG_S) {
-                              omega = if (omegaN == 0) (if (omegaPrior > 0f) 0.5f * omegaPrior + 0.5f * m else m)
-                                      else omega + (Tune.OMEGA_EMA * (m - omega)).toFloat()
-                              omegaN++
-                              lastSpeed = omega
+                          if (m >= Tune.SPEED_MIN_PX_S) {
+                              if (speedN == 0) {
+                                  speed = if (speedPrior > 0f && abs(m - speedPrior) < 0.5f * speedPrior) 0.5f * speedPrior + 0.5f * m else m
+                                  speedN++; speedRej = 0
+                              } else if (abs(m - speed) < Tune.SPEED_OUTLIER * speed) {
+                                  speed += (Tune.SPEED_EMA * (m - speed)).toFloat()
+                                  speedN++; speedRej = 0
+                              } else if (++speedRej >= 3) {
+                                  speed = m; speedN = 1; speedRej = 0   // скорость реально сменилась (уровень вырос)
+                              }
+                              lastSpeed = speed
                           }
                       }
                   }
               }
 
-              // скорость, которой сейчас можно верить (°/с), или 0
-              private fun currentOmega(): Float {
-                  if (omegaN > 0) return omega
-                  if (omegaPrior > 0f) return omegaPrior
+              // скорость, которой сейчас можно верить (px/с), или 0
+              private fun currentSpeed(): Float {
+                  if (speedN > 0) return speed
+                  if (speedPrior > 0f) return speedPrior
                   if (tkN >= 2) {
                       val dt = (tkT[tkN - 1] - tkT[tkN - 2]) / 1e9f
-                      if (dt > 0f) return abs(tkA[tkN - 1] - tkA[tkN - 2]) / dt
+                      if (dt > 0f) return abs(tkE[tkN - 1] - tkE[tkN - 2]) / dt
                   }
                   return 0f
               }
-
-              // [ПРОГНОЗ] Длина пути стрелки до угла z, считая отражение от краёв ±b (стрелка разворачивается на краю).
-              private fun pathDistance(a: Float, z: Float, dir: Int, b: Float): Float =
-                  if (dir > 0) { if (z >= a) z - a else (b - a) + (b - z) }
-                  else { if (z <= a) a - z else (a + b) + (z + b) }
 
               // точное ожидание до момента нажатия (сон до последних 3 мс, дальше активное ожидание)
               private fun waitUntil(tNs: Long) {
@@ -967,20 +949,22 @@ jobs:
                   if (seenZ && prevZx >= 0f && hypot(aZx - prevZx, aZy - prevZy) > 30f) resetSweep()
                   if (seenZ) { prevZx = aZx; prevZy = aZy } else prevZx = -1f
 
-                  val haveAngle = seenN && aHaveTh
-                  if (haveAngle) trackTick(frameNs, aTh, nowNs)
+                  val haveE = aHaveE
+                  framesAll++
+                  if (haveE) { framesLine++; trackTick(frameNs, aE, nowNs) }
+                  ready = haveE && swDir != 0 && currentSpeed() >= Tune.SPEED_MIN_PX_S
 
                   // самонастройка: после нажатия стрелка замирает; по месту остановки уточняем упреждение
                   if (calibPending) {
                       val dtMs = (nowNs - fireNs) / 1e6
                       if (dtMs > 900 || !seenZ) {
                           calibPending = false
-                      } else if (haveAngle && dtMs > 60 && (nowNs - lastTickNs) / 1e6 >= Tune.CAL_STILL_MS) {
+                      } else if (haveE && dtMs > 60 && (nowNs - lastTickNs) / 1e6 >= Tune.CAL_STILL_MS) {
                           calibPending = false
-                          if (fireOmega > Tune.OMEGA_MIN_DEG_S && Tune.CAL_GAIN > 0.0) {
+                          if (fireSpeed >= Tune.SPEED_MIN_PX_S && Tune.CAL_GAIN > 0.0) {
                               // early > 0: стрелка остановилась ДО центра зоны -> нажали рано -> упреждение уменьшить
-                              val early = (firePhi - aTh) * fireDir
-                              val errMs = early / fireOmega * 1000.0
+                              val early = -aE * fireDir
+                              val errMs = early / fireSpeed * 1000.0
                               if (abs(errMs) < Tune.CAL_MAX_ERR_MS) {
                                   leadMs = (leadMs - errMs * Tune.CAL_GAIN).toInt().coerceIn(0, Tune.LEAD_MAX_MS)
                                   save()
@@ -993,7 +977,8 @@ jobs:
                   if (waitChange) {
                       val moved = seenZ && hypot(aZx - lastZx, aZy - lastZy) > 25f
                       val dtMs = (nowNs - fireNs) / 1e6
-                      val stillRunning = haveAngle && dtMs > Tune.MISS_AFTER_MS && (nowNs - lastTickNs) / 1e6 < 100
+                      val stillRunning = (haveE && dtMs > Tune.MISS_AFTER_MS && (nowNs - lastTickNs) / 1e6 < 100) ||
+                          (!seenN && dtMs > Tune.MISS_OUT_MS)
                       if (!seenZ || moved) {
                           hits++
                           if (dtMs < 1500) lat = if (lat < 0) dtMs else lat * 0.7 + dtMs * 0.3
@@ -1008,38 +993,42 @@ jobs:
                   }
                   if (nowNs < blockUntilNs) return
                   if (!seenZ) { resetSweep(); return }
-                  if (!haveAngle || !havePivot) return   // ось ещё ищется (нужен один-два взмаха стрелки)
+                  if (!haveE) return
 
-                  // [ПРОГНОЗ] нужна известная скорость и хотя бы пара шагов после разворота
-                  val w = currentOmega()
-                  if (w < Tune.OMEGA_MIN_DEG_S || swDir == 0 || tkN < Tune.SWEEP_MIN_TICKS) return
+                  // [ПРОГНОЗ] нужна известная скорость и хотя бы пара шагов с последнего разворота
+                  val v = currentSpeed()
+                  if (v < Tune.SPEED_MIN_PX_S || swDir == 0 || tkN < Tune.SWEEP_MIN_TICKS) return
 
-                  // уточнённый угол в момент последнего шага: усредняем все шаги прохода, сдвинутые вперёд по скорости
+                  // уточнённое e в момент последнего шага: усредняем шаги прохода, сдвинутые вперёд по скорости
                   // (так случайная неточность времени одного кадра усредняется)
                   val k = min(tkN, 6)
                   val tL = tkT[tkN - 1]
-                  var thHat = 0.0
-                  for (i in tkN - k until tkN) thHat += tkA[i] + swDir * w * ((tL - tkT[i]) / 1e9)
-                  thHat /= k
+                  var eHat = 0.0
+                  for (i in tkN - k until tkN) eHat += tkE[i] + swDir * v * ((tL - tkT[i]) / 1e9)
+                  eHat /= k
 
-                  // когда стрелка дойдёт до центра зоны (с учётом отражения от края) и когда надо нажать
-                  val dist = pathDistance(thHat.toFloat(), aPhi, swDir, bAng)
-                  val tCross = tL + (dist / w * 1e9).toLong()
+                  // сколько px осталось до совпадения (меньше нуля = стрелка уже проехала зону)
+                  val remaining = -eHat * swDir
+                  if (remaining < 0.0) { lateNoted = false; return }
+                  val tCross = tL + (remaining / v * 1e9).toLong()
                   val tFire = tCross - leadMs * 1_000_000L
                   val etaMs = (tFire - nowNs) / 1e6
-                  val halfMs = aHalf / w * 1000.0
+                  val halfMs = aHalfPx / v * 1000.0
 
                   if (etaMs > Tune.COMMIT_MS) return                      // рано, ждём свежие кадры
-                  if (etaMs < -halfMs * Tune.LATE_TOL_FRAC) return        // опоздали -> ждём следующий проход, лучше не нажимать криво
+                  if (etaMs < -halfMs * Tune.LATE_TOL_FRAC) {             // опоздали -> ждём следующий проход, лучше не нажимать криво
+                      if (!lateNoted) { skippedLate++; lateNoted = true }
+                      return
+                  }
 
                   if (etaMs > 0) waitUntil(tFire)
                   click()
                   fireNs = System.nanoTime()
                   blockUntilNs = fireNs + max(cool, 300L) * 1_000_000L
                   waitChange = true; lastZx = aZx; lastZy = aZy
-                  fireDir = swDir; fireOmega = w; firePhi = aPhi
+                  fireDir = swDir; fireSpeed = v
                   calibPending = true
-                  lastSpeed = w
+                  lastSpeed = v
               }
 
               // ---------- окна ----------
@@ -1190,11 +1179,14 @@ jobs:
                           c.drawPath(path, pr)
                       }
                       if (running && contactMode) {
+                          // три точки: стрелка видна / слежение готово (скорость и направление известны) / зона видна
                           pr.style = Paint.Style.FILL
                           pr.color = if (seenN) color else Color.DKGRAY
-                          c.drawCircle(m - m * 0.28f, w * 0.93f, m * 0.13f, pr)
+                          c.drawCircle(m - m * 0.42f, w * 0.93f, m * 0.13f, pr)
+                          pr.color = if (ready) Color.parseColor("#00E676") else Color.DKGRAY
+                          c.drawCircle(m, w * 0.93f, m * 0.13f, pr)
                           pr.color = if (seenZ) color2 else Color.DKGRAY
-                          c.drawCircle(m + m * 0.28f, w * 0.93f, m * 0.13f, pr)
+                          c.drawCircle(m + m * 0.42f, w * 0.93f, m * 0.13f, pr)
                       }
                       if (ClickerAccessibility.inst == null) {
                           pr.style = Paint.Style.FILL; pr.color = Color.parseColor("#E53935")
@@ -1526,18 +1518,20 @@ jobs:
 
               private fun toggle() {
                   syncPos()
-                  running = !running
+                  val on = !running
+                  if (on) resetTracking()      // до запуска движка, чтобы он не увидел старые данные
+                  running = on
                   bubble.sync()
                   bubble.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                   if (running) {
-                      resetTracking()
                       aiming = false
                       applyAim()
                   } else {
                       val l = if (lat > 0) lat.toInt().toString() + " мс" else "—"
+                      val ln = if (framesAll > 0) framesLine * 100 / framesAll else 0
                       toast("Стоп. Нажатий: $clicks (ок $tapOk, отказ $tapFail), попаданий: $hits, промахов: $misses, " +
-                          "лаг: $l, упреждение: $leadMs мс, скорость: ${lastSpeed.toInt()} °/с, разворотов: $turns, " +
-                          "ось: " + (if (havePivot) "${pivX.toInt()},${pivY.toInt()}" else "не найдена"))
+                          "пропущено как «поздно»: $skippedLate, лаг: $l, упреждение: $leadMs мс, " +
+                          "скорость ${lvl + 1}/5, разворотов: $turns, линия стрелки найдена в $ln% кадров")
                   }
               }
 
