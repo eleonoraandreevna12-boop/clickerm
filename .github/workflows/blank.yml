@@ -96,7 +96,7 @@ jobs:
               override fun onInterrupt() {}
 
               fun tap(x: Float, y: Float, onResult: (Boolean) -> Unit) {
-                  h.post {
+                  h.postAtFrontOfQueue {
                       val path = Path().apply { moveTo(x, y) }
                       val g = GestureDescription.Builder()
                           .addStroke(GestureDescription.StrokeDescription(path, 0, 40))
@@ -132,6 +132,7 @@ jobs:
               private lateinit var cool: EditText
               private lateinit var adapt: CheckBox
               private lateinit var disappear: CheckBox
+              private lateinit var lvlF: EditText
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
@@ -155,6 +156,7 @@ jobs:
                   tol = field("Допуск цвета (0-255)", sp.getInt("tol", 25).toString())
                   pre = field("Задержка до клика, мс", sp.getLong("pre", 0L).toString())
                   cool = field("Пауза после нажатия, мс (для стрелки и зоны 400-800)", sp.getLong("cool", 150L).toString())
+                  lvlF = field("Скорость стрелки на старте, 1-5 (после каждого попадания растёт сама)", sp.getInt("lvl", 1).toString())
                   adapt = CheckBox(this).apply { text = "Адаптация к задержке (повтор клика)"; isChecked = sp.getBoolean("adapt", true) }
                   root.addView(adapt)
                   disappear = CheckBox(this).apply { text = "Режим: кликать, когда цвет ИСЧЕЗ"; isChecked = sp.getBoolean("disappear", false) }
@@ -171,10 +173,11 @@ jobs:
                   text("\nПосле запуска появится кружок, он остаётся поверх всех приложений.\n\n" +
                        "• Тап по кружку — старт / стоп.\n" +
                        "• Удержание — меню: 💧 пипетка с лупой (в режиме ⚡ два шага: сначала стрелка, потом зона), " +
-                       "🎯 прицел (круг вокруг дуги), 🔍 размер кружка, ⚡ режим (два цвета / один цвет), " +
+                       "🎯 прицел (круг вокруг дуги: в круг должны попадать и стрелка, и зона), 🔍 размер кружка, ⚡ режим (два цвета / один цвет), " +
                        "⏪ ⏩ упреждение: ⏪ жмёт раньше, ⏩ позже, ✕ выход.\n" +
-                       "• Внизу кружка при работе две точки: видно ли стрелку и зону.\n" +
-                       "• Скорость стрелки считается по каждому кадру, упреждение подстраивается само по месту остановки стрелки.\n" +
+                       "• Внизу кружка при работе две лампочки: горят, когда видна стрелка и когда видна зона. При каждом нажатии кружок вспыхивает белым.\n" +
+                       "• Круг должен охватывать зону и дугу вокруг неё примерно на ±45°: стрелку надо увидеть заранее, за ~150 мс до зоны.\n" +
+                       "• Скорость стрелки считается по шагам, разворот на краю замечается сразу, упреждение подстраивается само по месту остановки стрелки.\n" +
                        "• Сохранённые цвета — точки вокруг кружка. Тап — выбрать, удержание — удалить.")
                   setContentView(ScrollView(this).apply { addView(root) })
 
@@ -196,13 +199,14 @@ jobs:
                       val t = tol.text.toString().toIntOrNull() ?: 25
                       val p = pre.text.toString().toLongOrNull() ?: 0L
                       val c = cool.text.toString().toLongOrNull() ?: 150L
+                      val lv = (lvlF.text.toString().toIntOrNull() ?: 1).coerceIn(1, 5)
                       getSharedPreferences("kl", MODE_PRIVATE).edit()
-                          .putInt("tol", t).putLong("pre", p).putLong("cool", c)
+                          .putInt("tol", t).putLong("pre", p).putLong("cool", c).putInt("lvl", lv)
                           .putBoolean("adapt", adapt.isChecked).putBoolean("disappear", disappear.isChecked)
                           .apply()
                       val i = Intent(this, OverlayService::class.java)
                           .putExtra("code", res).putExtra("data", data)
-                          .putExtra("tol", t).putExtra("pre", p).putExtra("cool", c)
+                          .putExtra("tol", t).putExtra("pre", p).putExtra("cool", c).putExtra("lvl", lv)
                           .putExtra("adapt", adapt.isChecked)
                           .putExtra("disappear", disappear.isChecked)
                       startForegroundService(i)
@@ -250,12 +254,65 @@ jobs:
           import android.widget.TextView
           import android.widget.Toast
           import kotlin.math.abs
+          import kotlin.math.atan2
           import kotlin.math.cos
           import kotlin.math.hypot
           import kotlin.math.max
           import kotlin.math.min
           import kotlin.math.sin
           import kotlin.math.sqrt
+
+          // =====================================================================================
+          //  НАСТРОЙКИ ТОЧНОСТИ (всё, что можно подкрутить, собрано здесь)
+          //  Что измерено по видео: стрелка крутится вокруг неподвижной оси, идёт с ПОСТОЯННОЙ скоростью между
+          //  краями примерно ±58° и мгновенно разворачивается на краю. После каждого попадания скорость растёт,
+          //  а зона сужается. Игра обновляет стрелку реже, чем идут кадры записи экрана: часть кадров одинаковая.
+          //
+          //  КАК ЭТО РАБОТАЕТ: линия стрелки всегда проходит через ось качания. Когда стрелка «совпала» с зоной,
+          //  эта линия проходит через центр зоны. Поэтому следим за одной величиной e = расстояние (со знаком, px)
+          //  от центра зоны до линии стрелки. e = 0 — стрелка точно на зоне. Ось и углы искать не нужно.
+          // =====================================================================================
+          private object Tune {
+              // --- пять скоростей стрелки, °/с ---
+              // Первые четыре измерены по видео: 170, 203, 238, 275 (шаг растёт: +34, +35, +37).
+              // Пятая — оценка по тому же тренду: 275 + ~38 ≈ 312 °/с. Если в игре иначе — поправь число.
+              // Используется как подсказка: после каждого попадания скорость ждём в нужное число раз больше.
+              val SPEED_DEG_S = floatArrayOf(170f, 203f, 238f, 275f, 312f)
+
+              // --- чувствительность зрения ---
+              const val MIN_COLOR_TOL = 40        // минимальный допуск цвета (0-255). Мало цвета найдено -> больше; ловит фон -> меньше
+              const val TRACK_MIN_PX = 6          // пикселей стрелки, чтобы горела точка «вижу стрелку»
+              const val LINE_MIN_PX = 15          // пикселей стрелки, чтобы провести через них линию
+              const val LINE_MIN_ELONG = 8.0      // линия должна быть вытянутой (длина/толщина), иначе это не стрелка
+              const val ZONE_MIN_PX = 25          // пикселей зоны, чтобы считать зону найденной
+              const val LINE_MIN_INLIER_FRAC = 0.5 // какая доля красных пикселей должна лежать на одной линии; иначе кадр отбрасываем (фон)
+
+              // --- слежение за траекторией (e в пикселях экрана) ---
+              const val DUP_PX = 2.0f             // изменение e меньше этого = «тот же кадр». Больше -> меньше шума, но грубее
+              const val GAP_RESET_MS = 250        // стрелку не видно дольше этого -> новый проход, старое забыто
+              const val REGRESS_MIN_TICKS = 3     // сколько шагов нужно, чтобы пересчитать скорость
+              const val SWEEP_MIN_TICKS = 2       // сколько шагов после разворота нужно, чтобы уже целиться
+              const val SPEED_EMA = 0.35          // как быстро скорость подстраивается (0.1 плавно ... 0.6 резко)
+              const val SPEED_OUTLIER = 0.4       // измерение, отличающееся от прежней скорости больше чем на 40%, пропускаем
+              const val SPEED_E_FRAC = 0.6f       // скорость пересчитываем, пока стрелка ближе этой доли радиуса круга к зоне
+              const val SPEED_MIN_PX_S = 60f      // медленнее этого стрелкой не считаем
+
+              // --- время нажатия ---
+              const val COMMIT_MS = 45            // за сколько мс до нажатия «фиксируем» момент и ждём точно. Не меньше шага кадров игры
+              const val LATE_TOL_FRAC = 0.5       // можно опоздать не больше этой доли от полуширины зоны (в мс), иначе ждём следующий проход
+              const val LATE_CAP_MS = 20.0        // но не больше стольких мс, даже если зона измерена широкой
+              const val PRED_AGREE_MS = 15        // защита от случайных нажатий: прогнозы по двум соседним шагам должны совпасть с такой точностью (0 = выключить)
+              const val LEAD_STEP_MS = 5          // шаг кнопок ⏪ ⏩
+              const val LEAD_MAX_MS = 300
+              const val LEAD_CAL_SPAN_MS = 30     // самонастройка может уйти от упреждения, выставленного тобой, не дальше чем на столько мс
+
+              // --- самонастройка упреждения по месту остановки стрелки ---
+              const val CAL_GAIN = 0.2            // 0 = выключить самонастройку, 0.5 = быстро, но шумно
+              const val CAL_MAX_ERR_MS = 120.0    // ошибки больше этой считаем случайностью
+              const val CAL_STILL_MS = 120        // стрелка не двигалась столько мс = остановилась
+              const val MISS_AFTER_MS = 350       // стрелка всё ещё бежит через столько мс после нажатия = промах
+              const val MISS_OUT_MS = 700         // стрелка пропала из круга, а зона не сменилась за столько мс = промах
+          }
 
           class OverlayService : Service() {
               private class Act(val label: String, val bg: Int, val deg: Int, val onClick: () -> Unit)
@@ -291,6 +348,8 @@ jobs:
               @Volatile private var clicks = 0
               @Volatile private var tapOk = 0
               @Volatile private var tapFail = 0
+              @Volatile private var hits = 0
+              @Volatile private var misses = 0
 
               private var tol = 25; private var pre = 0L; private var cool = 150L
               private var adapt = true; private var wantPresent = true
@@ -301,36 +360,63 @@ jobs:
               private val zxs = IntArray(8000)
               private val zys = IntArray(8000)
               private var rowBuf = ByteArray(4096)
-              private val histT = LongArray(6)
-              private val histG = FloatArray(6)
-              private var histN = 0
               private var aTs = 0L
               private var aZn = 0
               private var aNn = 0
               private var aZx = 0f
               private var aZy = 0f
-              private var aRz = 0f
-              private var aGc = 0f
               private var prevZx = -1f
               private var prevZy = -1f
               private var waitChange = false
               private var lastZx = 0f
               private var lastZy = 0f
-              private val histX = FloatArray(6)
-              private val histY = FloatArray(6)
-              private var aTipX = 0f
-              private var aTipY = 0f
-              private var fireVx = 0f
-              private var fireVy = 0f
-              private var fireZx = 0f
-              private var fireZy = 0f
               private var calibPending = false
-              private var calStill = 0
-              private var calPx = 0f
-              private var calPy = 0f
               private var lastSpeed = 0f
               private var fireNs = 0L
               private var blockUntilNs = 0L
+
+              // ---- линия стрелки и зона (ось качания не нужна) ----
+              private var aHaveE = false
+              private var aE = 0f           // e: расстояние от центра зоны до линии стрелки со знаком, px
+              private var aHalfPx = 8f      // полуширина зоны поперёк стрелки, px
+              private var zLim = 0f
+              private var prevUx = 0.0      // направление линии в прошлом кадре: держим знак e постоянным
+              private var prevUy = -1.0
+
+              // ---- траектория: шаги стрелки с последнего разворота ----
+              private var lastE = Float.NaN
+              private var swDir = 0         // знак изменения e: +1 / -1, 0 пока неизвестно
+              private val tkT = LongArray(8)
+              private val tkE = FloatArray(8)
+              private var tkN = 0
+              private var lastTickNs = 0L
+              private var speed = 0f        // скорость e около зоны, px/с (сглаженная)
+              private var speedN = 0
+              private var speedRej = 0
+              private var speedPrior = 0f   // догадка о скорости на новом уровне
+              private var lvl = 0           // номер скорости 0..4 (на экране 1..5)
+              private var startLvl = 0
+              private var turns = 0
+              private var lateNoted = false
+              @Volatile private var skippedLate = 0
+              @Volatile private var framesAll = 0
+              @Volatile private var framesLine = 0
+
+              // ---- что было в момент последнего нажатия (для самонастройки) ----
+              private var fireDir = 0
+              private var fireSpeed = 0f
+
+              // ---- защита от случайных нажатий, журнал ошибок, лампочки и вспышка ----
+              private var leadBase = 80                 // упреждение, выставленное тобой; самонастройка держится рядом с ним
+              private var lastPred = 0L
+              private var prevPred = 0L
+              private var lastPredTickT = 0L
+              private val calErrs = IntArray(6)         // последние ошибки по месту остановки стрелки, мс (+ рано, - поздно)
+              private var calErrN = 0
+              @Volatile private var flashUntilNs = 0L  // кружок вспыхивает при каждом нажатии
+              private var lampN = false
+              private var lampZ = false
+              private var lampNs = 0L
 
               private val palette = ArrayList<Int>()
               private var aiming = true
@@ -363,6 +449,7 @@ jobs:
                   cool = i.getLongExtra("cool", 150)
                   adapt = i.getBooleanExtra("adapt", true)
                   wantPresent = !i.getBooleanExtra("disappear", false)
+                  startLvl = (i.getIntExtra("lvl", 1) - 1).coerceIn(0, 4)
                   startFg()
                   load()
 
@@ -489,6 +576,7 @@ jobs:
                       clampAll()
                       hudX = if (hudX + bubbleSize() / 2 < W / 2) 0 else W - bubbleSize()
                       relayoutAll()
+                      resetSweep(); speed = 0f; speedN = 0; speedPrior = 0f // после поворота экрана пиксели другие
                   }
               }
 
@@ -589,6 +677,9 @@ jobs:
                   s.tap((tx + offX).toFloat(), (ty + offY).toFloat()) { ok ->
                       if (ok) { tapOk++ } else { tapFail++ }
                   }
+                  flashUntilNs = System.nanoTime() + 200_000_000L      // вспышка кружка: видно, когда и как часто жмёт
+                  ui.post { bubble.invalidate() }
+                  ui.postDelayed({ bubble.invalidate() }, 220)
               }
 
               private fun loop() {
@@ -628,6 +719,9 @@ jobs:
 
 
               // ---------- контакт двух цветов: стрелка + зона ----------
+
+              // [ЗРЕНИЕ] Один кадр: находим пиксели стрелки и зоны. Из них получаем одну величину e —
+              // расстояние (со знаком) от центра зоны до линии стрелки. e == 0 значит «стрелка на зоне».
               private fun analyzeFrame(): Int = synchronized(lock) {
                   val n = try { reader?.acquireLatestImage() } catch (e: Exception) { null }
                   if (n == null) return 0
@@ -643,12 +737,12 @@ jobs:
                   val x1 = min(n.width, bx + fw)
                   val y1 = min(n.height, by + fh)
                   aTs = n.timestamp
-                  aNn = 0; aZn = 0
+                  aNn = 0; aZn = 0; aHaveE = false
                   if (x1 - x0 < 8 || y1 - y0 < 8) return 1
                   val need = (x1 - x0) * ps
                   if (rowBuf.size < need) rowBuf = ByteArray(need)
 
-                  val t = max(tol, 40)
+                  val t = max(tol, Tune.MIN_COLOR_TOL)
                   val ar = Color.red(color); val ag = Color.green(color); val ab = Color.blue(color)
                   val c2 = color2
                   val br = Color.red(c2); val bg = Color.green(c2); val bb = Color.blue(c2)
@@ -687,8 +781,9 @@ jobs:
                       }
                   }
                   aNn = nn; aZn = nz
-                  if (nz >= 25) {
-                      // грубый центр зоны, потом отбрасываем одиночные пиксели-помехи
+
+                  // зона: центр (одиночные пиксели-помехи отбрасываем)
+                  if (nz >= Tune.ZONE_MIN_PX) {
                       var sx = 0L; var sy = 0L
                       for (i in 0 until nz) { sx += zxs[i]; sy += zys[i] }
                       var cx = sx.toFloat() / nz
@@ -701,127 +796,270 @@ jobs:
                           if (hypot(zxs[i] - cx, zys[i] - cy) <= lim) { sx2 += zxs[i]; sy2 += zys[i]; n2++ }
                       }
                       if (n2 >= 10) { cx = sx2.toFloat() / n2; cy = sy2.toFloat() / n2 }
-                      var rz = 0f
-                      for (i in 0 until nz) {
-                          val d = hypot(zxs[i] - cx, zys[i] - cy)
-                          if (d <= lim && d > rz) rz = d
-                      }
-                      aZx = cx; aZy = cy; aRz = rz
-                      if (nn >= 2) {
-                          var g2 = Float.MAX_VALUE
-                          var bi = 0
+                      aZx = cx; aZy = cy; zLim = lim
+                  }
+
+                  // стрелка: линия по пикселям, потом e
+                  if (nn >= Tune.TRACK_MIN_PX && nz >= Tune.ZONE_MIN_PX) analyzeNeedle(nn)
+                  1
+              }
+
+              // [ЗРЕНИЕ] Линия стрелки: метод главных осей с отбраковкой выбросов (фон с похожим цветом).
+              // Знак e держим постоянным: направление линии берём так, чтобы оно совпадало с прошлым кадром.
+              private fun analyzeNeedle(nn: Int) {
+                  var mx = 0.0; var my = 0.0
+                  for (i in 0 until nn) { mx += nxs[i]; my += nys[i] }
+                  mx /= nn; my /= nn
+                  val lim = max(3.0, fw * 0.012)
+                  var ux = 0.0; var uy = -1.0; var elong = 0.0; var cnt = nn
+                  for (pass in 0..1) {
+                      if (pass == 1) {
+                          var sx = 0.0; var sy = 0.0; var c = 0
                           for (i in 0 until nn) {
-                              val ddx = nxs[i] - cx
-                              val ddy = nys[i] - cy
-                              val d2 = ddx * ddx + ddy * ddy
-                              if (d2 < g2) { g2 = d2; bi = i }
+                              if (abs((nxs[i] - mx) * uy - (nys[i] - my) * ux) <= lim) { sx += nxs[i]; sy += nys[i]; c++ }
                           }
-                          aGc = sqrt(g2)
-                          aTipX = nxs[bi].toFloat(); aTipY = nys[bi].toFloat()
+                          if (c < Tune.LINE_MIN_PX) return
+                          mx = sx / c; my = sy / c; cnt = c
+                      }
+                      var sxx = 0.0; var sxy = 0.0; var syy = 0.0
+                      for (i in 0 until nn) {
+                          val ex = nxs[i] - mx
+                          val ey = nys[i] - my
+                          if (pass == 1 && abs(ex * uy - ey * ux) > lim) continue
+                          sxx += ex * ex; sxy += ex * ey; syy += ey * ey
+                      }
+                      val half = (sxx + syy) / 2.0
+                      val rr = sqrt(((sxx - syy) / 2.0) * ((sxx - syy) / 2.0) + sxy * sxy)
+                      val l1 = half + rr
+                      val l2 = max(half - rr, 1e-3)
+                      val a = 0.5 * atan2(2.0 * sxy, sxx - syy)
+                      ux = cos(a); uy = sin(a); elong = l1 / l2
+                  }
+                  if (cnt < Tune.LINE_MIN_PX || elong < Tune.LINE_MIN_ELONG) return
+                  if (cnt < nn * Tune.LINE_MIN_INLIER_FRAC) return   // красное разбросано по фону, а не лежит на одной линии
+                  if (ux * prevUx + uy * prevUy < 0.0) { ux = -ux; uy = -uy }
+                  prevUx = ux; prevUy = uy
+                  val nx = -uy
+                  val ny = ux
+                  aE = ((aZx - mx) * nx + (aZy - my) * ny).toFloat()
+                  // полуширина зоны поперёк стрелки: нужна, чтобы знать, сколько мс можно ошибиться
+                  var pmin = 1e9; var pmax = -1e9
+                  for (i in 0 until aZn) {
+                      if (hypot(zxs[i] - aZx, zys[i] - aZy) > zLim) continue
+                      val p = (zxs[i] - aZx) * nx + (zys[i] - aZy) * ny
+                      if (p < pmin) pmin = p
+                      if (p > pmax) pmax = p
+                  }
+                  if (pmax > pmin) aHalfPx = ((pmax - pmin) / 2.0).toFloat().coerceIn(2f, max(4f, fw * 0.2f))
+                  aHaveE = true
+              }
+
+              // [ТРАЕКТОРИЯ] Забываем текущий проход стрелки (после разворота-прыжка, нового раунда или пропажи стрелки).
+              private fun resetSweep() {
+                  tkN = 0; swDir = 0; lastE = Float.NaN; lateNoted = false
+                  lastPred = 0L; prevPred = 0L; lastPredTickT = 0L
+              }
+
+              // Новый раунд (попали): стрелка ускорилась. Скорость учим заново, но с подсказкой из таблицы пяти скоростей.
+              private fun newRound() {
+                  val step = if (lvl < 4) Tune.SPEED_DEG_S[lvl + 1] / Tune.SPEED_DEG_S[lvl] else 1f
+                  speedPrior = if (speed > 0f) speed * step else 0f
+                  if (lvl < 4) lvl++
+                  speed = 0f; speedN = 0; speedRej = 0
+                  resetSweep()
+              }
+
+              private fun resetTracking() {
+                  waitChange = false; blockUntilNs = 0L; prevZx = -1f
+                  seenN = false; seenZ = false; calibPending = false
+                  resetSweep()
+                  speed = 0f; speedN = 0; speedRej = 0; speedPrior = 0f
+                  lvl = startLvl
+                  hits = 0; misses = 0; turns = 0; skippedLate = 0
+                  framesAll = 0; framesLine = 0; calErrN = 0; leadBase = leadMs
+                  prevUx = 0.0; prevUy = -1.0
+              }
+
+              // [ТРАЕКТОРИЯ + РАЗВОРОТ + СКОРОСТЬ]
+              // Вызывается для каждого кадра. Одинаковые кадры (игра обновляет стрелку реже, чем идёт запись) пропускаем.
+              // Новый «шаг» стрелки:
+              //  - знак изменения e поменялся -> РАЗВОРОТ: старая траектория забыта, скорость сохранена
+              //  - стрелки не было видно дольше GAP_RESET_MS или e прыгнул больше диаметра круга -> новый проход
+              //  - иначе точка добавляется в проход и пересчитывается скорость (наклон прямой e по времени)
+              private fun trackTick(frameNs: Long, e: Float, nowNs: Long) {
+                  if (!lastE.isNaN() && (nowNs - lastTickNs) / 1e6 > Tune.GAP_RESET_MS) resetSweep()
+                  if (!lastE.isNaN()) {
+                      val d = e - lastE
+                      if (abs(d) < Tune.DUP_PX) return
+                      if (abs(d) > fw) {
+                          resetSweep()
+                      } else {
+                          val dir = if (d > 0f) 1 else -1
+                          if (swDir != 0 && dir != swDir) { tkN = 0; turns++; lateNoted = false }
+                          swDir = dir
                       }
                   }
-                  1
+                  lastE = e
+                  lastTickNs = nowNs
+                  if (tkN == tkT.size) {
+                      for (i in 1 until tkT.size) { tkT[i - 1] = tkT[i]; tkE[i - 1] = tkE[i] }
+                      tkN--
+                  }
+                  tkT[tkN] = frameNs; tkE[tkN] = e; tkN++
+
+                  // скорость: МНК-наклон e по времени за последние шаги (пока стрелка не слишком далеко от зоны: там e почти линейно)
+                  if (tkN >= Tune.REGRESS_MIN_TICKS && abs(e) < Tune.SPEED_E_FRAC * fw / 2f) {
+                      val k = min(tkN, 6)
+                      val s0 = tkN - k
+                      var mt = 0.0; var me = 0.0
+                      for (i in 0 until k) { mt += tkT[s0 + i]; me += tkE[s0 + i] }
+                      mt /= k; me /= k
+                      var num = 0.0; var den = 0.0
+                      for (i in 0 until k) {
+                          val dt = (tkT[s0 + i] - mt) / 1e9
+                          num += dt * (tkE[s0 + i] - me); den += dt * dt
+                      }
+                      if (den > 0.0) {
+                          val m = abs(num / den).toFloat()
+                          if (m >= Tune.SPEED_MIN_PX_S) {
+                              if (speedN == 0) {
+                                  speed = if (speedPrior > 0f && abs(m - speedPrior) < 0.5f * speedPrior) 0.5f * speedPrior + 0.5f * m else m
+                                  speedN++; speedRej = 0
+                              } else if (abs(m - speed) < Tune.SPEED_OUTLIER * speed) {
+                                  speed += (Tune.SPEED_EMA * (m - speed)).toFloat()
+                                  speedN++; speedRej = 0
+                              } else if (++speedRej >= 3) {
+                                  speed = m; speedN = 1; speedRej = 0   // скорость реально сменилась (уровень вырос)
+                              }
+                              lastSpeed = speed
+                          }
+                      }
+                  }
+              }
+
+              // скорость, которой сейчас можно верить (px/с), или 0
+              private fun currentSpeed(): Float {
+                  if (speedN > 0) return speed
+                  if (speedPrior > 0f) return speedPrior
+                  if (tkN >= 2) {
+                      val dt = (tkT[tkN - 1] - tkT[tkN - 2]) / 1e9f
+                      if (dt > 0f) return abs(tkE[tkN - 1] - tkE[tkN - 2]) / dt
+                  }
+                  return 0f
+              }
+
+              // точное ожидание до момента нажатия (сон до последних 3 мс, дальше активное ожидание)
+              private fun waitUntil(tNs: Long) {
+                  while (running) {
+                      val rem = tNs - System.nanoTime()
+                      if (rem <= 0L) return
+                      if (rem > 3_000_000L) Thread.sleep(1) else Thread.yield()
+                  }
               }
 
               private fun tickContact() {
                   if (analyzeFrame() == 0) { Thread.sleep(1); return }
                   val nowNs = System.nanoTime()
-                  seenN = aNn >= 2
-                  seenZ = aZn >= 25
+                  seenN = aNn >= Tune.TRACK_MIN_PX
+                  seenZ = aZn >= Tune.ZONE_MIN_PX
+                  // время кадра (если часы кадра и System.nanoTime не совпали — берём текущее)
+                  val frameNs = if (aTs > 0 && abs(nowNs - aTs) < 500_000_000L) aTs else nowNs
 
-                  // самонастройка: после нажатия стрелка замирает, по месту остановки уточняем упреждение
+                  // зона прыгнула -> новый раунд, старая траектория не нужна
+                  if (seenZ && prevZx >= 0f && hypot(aZx - prevZx, aZy - prevZy) > 30f) resetSweep()
+                  if (seenZ) { prevZx = aZx; prevZy = aZy } else prevZx = -1f
+
+                  val haveE = aHaveE
+                  framesAll++
+                  if (haveE) { framesLine++; trackTick(frameNs, aE, nowNs) }
+                  // лампочки на кружке: загораются сразу, как только цвет появился или пропал
+                  if ((seenN != lampN || seenZ != lampZ) && nowNs - lampNs > 40_000_000L) {
+                      lampN = seenN; lampZ = seenZ; lampNs = nowNs
+                      ui.post { bubble.invalidate() }
+                  }
+
+                  // самонастройка: после нажатия стрелка замирает; по месту остановки уточняем упреждение
                   if (calibPending) {
                       val dtMs = (nowNs - fireNs) / 1e6
-                      if (dtMs > 700 || !seenZ) {
+                      if (dtMs > 900 || !seenZ) {
                           calibPending = false
-                      } else if (seenN && dtMs > 25) {
-                          if (hypot(aTipX - calPx, aTipY - calPy) < 1.5f) { calStill++ } else { calStill = 0 }
-                          calPx = aTipX; calPy = aTipY
-                          if (calStill >= 2) {
-                              calibPending = false
-                              val sp = hypot(fireVx, fireVy)
-                              if (sp > 30f) {
-                                  val sgn = ((fireZx - aTipX) * fireVx + (fireZy - aTipY) * fireVy) / sp
-                                  val errMs = sgn / sp * 1000.0
-                                  if (abs(errMs) < 150.0) {
-                                      leadMs = (leadMs - errMs * 0.5).toInt().coerceIn(0, 250)
-                                      save()
-                                  }
+                      } else if (haveE && dtMs > 60 && (nowNs - lastTickNs) / 1e6 >= Tune.CAL_STILL_MS) {
+                          calibPending = false
+                          if (fireSpeed >= Tune.SPEED_MIN_PX_S && Tune.CAL_GAIN > 0.0) {
+                              // early > 0: стрелка остановилась ДО центра зоны -> нажали рано -> упреждение уменьшить
+                              val early = -aE * fireDir
+                              val errMs = early / fireSpeed * 1000.0
+                              if (abs(errMs) < Tune.CAL_MAX_ERR_MS) {
+                                  calErrs[calErrN % calErrs.size] = errMs.toInt(); calErrN++
+                                  val lo = max(0, leadBase - Tune.LEAD_CAL_SPAN_MS)
+                                  val hi = min(Tune.LEAD_MAX_MS, leadBase + Tune.LEAD_CAL_SPAN_MS)
+                                  leadMs = (leadMs - errMs * Tune.CAL_GAIN).toInt().coerceIn(lo, hi)
+                                  save()
                               }
                           }
                       }
                   }
 
-                  // после нажатия ждём новую зону
+                  // после нажатия ждём: зона сменилась (попали) или стрелка бежит дальше (промах)
                   if (waitChange) {
                       val moved = seenZ && hypot(aZx - lastZx, aZy - lastZy) > 25f
                       val dtMs = (nowNs - fireNs) / 1e6
+                      val stillRunning = (haveE && dtMs > Tune.MISS_AFTER_MS && (nowNs - lastTickNs) / 1e6 < 100) ||
+                          (!seenN && dtMs > Tune.MISS_OUT_MS)
                       if (!seenZ || moved) {
+                          hits++
                           if (dtMs < 1500) lat = if (lat < 0) dtMs else lat * 0.7 + dtMs * 0.3
-                          waitChange = false; histN = 0
+                          waitChange = false
+                          newRound()
+                      } else if (stillRunning) {
+                          misses++
+                          waitChange = false
                       } else if (dtMs > 3000) {
-                          waitChange = false; histN = 0
+                          waitChange = false; resetSweep()
                       } else return
                   }
                   if (nowNs < blockUntilNs) return
-                  if (!seenZ) { histN = 0; prevZx = -1f; return }
-                  if (prevZx >= 0f && hypot(aZx - prevZx, aZy - prevZy) > 30f) histN = 0
-                  prevZx = aZx; prevZy = aZy
-                  if (!seenN) return
+                  if (!seenZ) { resetSweep(); return }
+                  if (!haveE) return
 
-                  // история кадров: расстояние от кончика стрелки до центра зоны
-                  val t = if (aTs > 0) aTs else nowNs
-                  if (histN > 0 && abs(aGc - histG[histN - 1]) > 120f) histN = 0
-                  if (histN == histT.size) {
-                      for (i in 1 until histT.size) {
-                          histT[i - 1] = histT[i]; histG[i - 1] = histG[i]
-                          histX[i - 1] = histX[i]; histY[i - 1] = histY[i]
-                      }
-                      histN--
+                  // [ПРОГНОЗ] нужна известная скорость и хотя бы пара шагов с последнего разворота
+                  val v = currentSpeed()
+                  if (v < Tune.SPEED_MIN_PX_S || swDir == 0 || tkN < Tune.SWEEP_MIN_TICKS) return
+                  if (speedN == 0 && speedPrior <= 0f) return   // скорость ещё не измерена: по двум шагам не жмём, это гадание
+
+                  // уточнённое e в момент последнего шага: усредняем шаги прохода, сдвинутые вперёд по скорости
+                  // (так случайная неточность времени одного кадра усредняется)
+                  val k = min(tkN, 6)
+                  val tL = tkT[tkN - 1]
+                  var eHat = 0.0
+                  for (i in tkN - k until tkN) eHat += tkE[i] + swDir * v * ((tL - tkT[i]) / 1e9)
+                  eHat /= k
+
+                  // сколько px осталось до совпадения (меньше нуля = стрелка уже проехала зону)
+                  val remaining = -eHat * swDir
+                  if (remaining < 0.0) { lateNoted = false; return }
+                  val tCross = tL + (remaining / v * 1e9).toLong()
+                  // защита от случайных нажатий: прогнозы по двум соседним шагам стрелки должны совпасть
+                  if (tL != lastPredTickT) { prevPred = lastPred; lastPred = tCross; lastPredTickT = tL } else lastPred = tCross
+                  if (Tune.PRED_AGREE_MS > 0 && (prevPred == 0L || abs(lastPred - prevPred) / 1e6 > Tune.PRED_AGREE_MS)) return
+                  val tFire = tCross - leadMs * 1_000_000L
+                  val etaMs = (tFire - nowNs) / 1e6
+                  val halfMs = min(aHalfPx / v * 1000.0, Tune.LATE_CAP_MS)
+
+                  if (etaMs > Tune.COMMIT_MS) return                      // рано, ждём свежие кадры
+                  if (etaMs < -halfMs * Tune.LATE_TOL_FRAC) {             // опоздали -> ждём следующий проход, лучше не нажимать криво
+                      if (!lateNoted) { skippedLate++; lateNoted = true }
+                      return
                   }
-                  histT[histN] = t; histG[histN] = aGc; histX[histN] = aTipX; histY[histN] = aTipY
-                  histN++
 
-                  // скорость стрелки считается заново по каждому кадру, поэтому любая из пяти скоростей подхватывается сразу
-                  val k = min(histN, 4)
-                  var approach = 0.0
-                  var vx = 0f
-                  var vy = 0f
-                  if (k >= 3) {
-                      val s0 = histN - k
-                      var mt = 0.0; var mg = 0.0
-                      for (i in 0 until k) { mt += histT[s0 + i]; mg += histG[s0 + i] }
-                      mt /= k; mg /= k
-                      var num = 0.0; var den = 0.0
-                      for (i in 0 until k) {
-                          val dt = (histT[s0 + i] - mt) / 1e9
-                          num += dt * (histG[s0 + i] - mg); den += dt * dt
-                      }
-                      if (den > 0) approach = -num / den
-                      val dtS = (histT[histN - 1] - histT[s0]) / 1e9f
-                      if (dtS > 0f) {
-                          vx = (histX[histN - 1] - histX[s0]) / dtS
-                          vy = (histY[histN - 1] - histY[s0]) / dtS
-                      }
-                  }
-                  lastSpeed = hypot(vx, vy)
-
-                  // возраст кадра: пока мы его разбирали, стрелка уже сдвинулась
-                  val ageRaw = (nowNs - aTs) / 1e6
-                  val age = if (ageRaw in 0.0..120.0) ageRaw else 0.0
-
-                  // жмём, когда за время упреждения стрелка дойдёт до центра зоны
-                  val core = aGc <= aRz * 0.5f
-                  val predicted = approach > 20.0 && aGc / approach * 1000.0 <= leadMs + age &&
-                      aGc <= max(aRz * 3f, (approach * 0.35).toFloat())
-                  if (core || predicted) {
-                      click()
-                      fireNs = System.nanoTime()
-                      blockUntilNs = fireNs + max(cool, 300L) * 1_000_000L
-                      waitChange = true; lastZx = aZx; lastZy = aZy; histN = 0
-                      fireVx = vx; fireVy = vy; fireZx = aZx; fireZy = aZy
-                      calibPending = true; calStill = 0; calPx = aTipX; calPy = aTipY
-                  }
+                  if (etaMs > 0) waitUntil(tFire)
+                  click()
+                  fireNs = System.nanoTime()
+                  blockUntilNs = fireNs + max(cool, 300L) * 1_000_000L
+                  waitChange = true; lastZx = aZx; lastZy = aZy
+                  fireDir = swDir; fireSpeed = v
+                  calibPending = true
+                  lastSpeed = v
               }
 
               // ---------- окна ----------
@@ -942,7 +1180,8 @@ jobs:
                           pr.alpha = (200 * (1f - phase)).toInt()
                           c.drawCircle(m, m, base + (m - base) * phase, pr)
                       }
-                      pr.style = Paint.Style.FILL; pr.color = Color.parseColor("#F2151A21")
+                      val flash = System.nanoTime() < flashUntilNs
+                      pr.style = Paint.Style.FILL; pr.color = if (flash) Color.WHITE else Color.parseColor("#F2151A21")
                       c.drawCircle(m, m, base, pr)
                       pr.style = Paint.Style.STROKE; pr.strokeWidth = m * 0.10f
                       pr.color = if (running) green else Color.WHITE
@@ -972,6 +1211,7 @@ jobs:
                           c.drawPath(path, pr)
                       }
                       if (running && contactMode) {
+                          // две лампочки: стрелка видна / зона видна
                           pr.style = Paint.Style.FILL
                           pr.color = if (seenN) color else Color.DKGRAY
                           c.drawCircle(m - m * 0.28f, w * 0.93f, m * 0.13f, pr)
@@ -1100,11 +1340,11 @@ jobs:
                           collapse()
                       },
                       Act("⏪", Color.parseColor("#FB8C00"), 180) {
-                          leadMs = min(300, leadMs + 10); save()
+                          leadMs = min(Tune.LEAD_MAX_MS, leadMs + Tune.LEAD_STEP_MS); leadBase = leadMs; save()
                           toast("Упреждение $leadMs мс — жмёт раньше"); keepMenu()
                       },
                       Act("⏩", Color.parseColor("#FB8C00"), 0) {
-                          leadMs = max(0, leadMs - 10); save()
+                          leadMs = max(0, leadMs - Tune.LEAD_STEP_MS); leadBase = leadMs; save()
                           toast("Упреждение $leadMs мс — жмёт позже"); keepMenu()
                       }
                   )
@@ -1308,17 +1548,22 @@ jobs:
 
               private fun toggle() {
                   syncPos()
-                  running = !running
+                  val on = !running
+                  if (on) resetTracking()      // до запуска движка, чтобы он не увидел старые данные
+                  running = on
                   bubble.sync()
                   bubble.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                   if (running) {
-                      histN = 0; waitChange = false; blockUntilNs = 0L; prevZx = -1f
-                      seenN = false; seenZ = false
                       aiming = false
                       applyAim()
                   } else {
                       val l = if (lat > 0) lat.toInt().toString() + " мс" else "—"
-                      toast("Стоп. Нажатий: $clicks (ок $tapOk, отказ $tapFail), лаг: $l, упреждение: $leadMs мс, скорость: ${lastSpeed.toInt()} px/с")
+                      val ln = if (framesAll > 0) framesLine * 100 / framesAll else 0
+                      val ce = if (calErrN == 0) "нет данных" else (0 until min(calErrN, calErrs.size)).joinToString(" ") { calErrs[it].toString() }
+                      toast("Стоп. Нажатий: $clicks (ок $tapOk, отказ $tapFail), попаданий: $hits, промахов: $misses, " +
+                          "пропущено как «поздно»: $skippedLate, лаг: $l, упреждение: $leadMs мс, " +
+                          "разворотов: $turns, линия стрелки найдена в $ln% кадров. " +
+                          "Ошибка по остановке стрелки, мс (+ рано, − поздно): $ce")
                   }
               }
 
